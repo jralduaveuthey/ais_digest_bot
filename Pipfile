@@ -1,0 +1,22 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+requests = "==2.31.0"
+langchain = "==0.0.202"
+pinecone-client = "==2.2.2"
+tqdm = "==4.65.0"
+openai = "==0.27.8"
+tiktoken = "==0.4.0"
+python-dotenv = "*"
+boto3 = "*"
+elevenlabs = "*"
+bs4 = "*"
+youtube-transcript-api = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"
