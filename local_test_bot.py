@@ -111,7 +111,7 @@ def process_generic_link(url):
     text = '\n'.join(chunk for chunk in chunks if chunk)
 
     if "New Comment Submit" in text: #so tjat the comments are not included
-        text = text[:text.index("New Comment Submit")] #TODO: test further and make sure that all LW/EA posts have this substring
+        text = text[:text.index("New Comment Submit")] 
     return text
 
 def process_youtube_link(url):
@@ -161,7 +161,6 @@ def generate_response(text, username, S3_BUCKET, OPENAI_API_KEY):
     # Load conversation history from the JSON file
     conversation_history = load_conversation_history(username, S3_BUCKET)
 
-    #TODO: (low prio) a better way to limit the conversation history
     # # Update conversation_history to keep only the messages containing the last 3000 charachters...so it does not hit token limit and so that it is cheaper
     # total_length = sum(len(x[0]) + len(x[1]) for x in conversation_history)# calculate the total length
     # while total_length > 3000:# keep popping from the front of the list until total length <= 3000

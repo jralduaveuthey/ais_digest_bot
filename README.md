@@ -1,8 +1,8 @@
 AI Safety Digest Telegram bot
 
 # Features
-## LLM support
-- It is built with langchain to it is pretty straightforward to change the codes to work with other LLMs (e.g. Claude, ...)
+- LLM provider agnostic: It is built with langchain to it is pretty straightforward to change the codes to work with other LLMs (e.g. Claude, ...)
+- Easy to setup. Instructions bellow. For the deployment of your bot's function you just need to run one python file.
 
 # Setup instructions
 ## General Notes
@@ -60,3 +60,19 @@ To run the later deployment.py script successfully, you need to set up a AWS acc
 - Start Docker Desktop. Necessary for the deployment.py to build the container image with the codes of your chatbot.
 - The local_test_bot.py already has a working functionality so you can just run deployment.py.
 - deployment.py will create or update an ECR repository, build and push a Docker image, and create or update a Lambda function using that image.
+
+## A bit more AWS (API Gateway)
+Follow instructions in this [tutorial>HTTP API in the API Gateway service
+](https://dev.to/epam_india_python/telegram-ai-bot-creation-using-chatgpt-and-aws-lambda-python-5f6g).  
+Note: so that the API Gateway can trigger the lambda you have to select the version 1.0 for the lambda when creating the HTTP API.
+![alt text](imgs/image.png)
+
+
+Also the route has to be ANY and not POST cause otherwise does not work.
+![alt text](imgs/image-1.png)
+
+When setting up the webhook you have to use the url that appears in the trigger from the lambda function and not the Invoke URL from the API Gateway.
+
+In my case it looks something like this: `https://api.telegram.org/bot123456:YYYY/setWebhook?url=https://XXXX.execute-api.eu-central-1.amazonaws.com/chatbot-ais-digest`
+
+![alt text](imgs/image-2.png)

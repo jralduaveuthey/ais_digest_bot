@@ -63,10 +63,10 @@ with open(local_test_bot_path, 'r') as local_test_bot_file:
             # Otherwise, write the line to lambda-main.py
             lambda_main_file.write(line)
 
-# Just to be sure, replace '_local' with '_cloud'
+# Just to be sure, replace '_local' with ''
 with open(lambda_main_path, 'r') as file:
     file_data = file.read()
-file_data = file_data.replace('_local', '_cloud')
+file_data = file_data.replace('_local', '')
 with open(lambda_main_path, 'w') as file:
     file.write(file_data)
 
