@@ -76,3 +76,7 @@ When setting up the webhook you have to use the url that appears in the trigger 
 In my case it looks something like this: `https://api.telegram.org/bot123456:YYYY/setWebhook?url=https://XXXX.execute-api.eu-central-1.amazonaws.com/chatbot-ais-digest`
 
 ![alt text](imgs/image-2.png)
+
+
+# Test and deploy
+You can test by writing in your telegram to the local version on your bot and then running/debugging locally local_test_bot.py. Once it is working locally just run deployment.py to modify the bot in the cloud.

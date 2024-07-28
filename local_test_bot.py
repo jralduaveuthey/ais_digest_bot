@@ -87,12 +87,27 @@ def process_generic_link(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
+
+    # Process arXiv URLs
+    if 'arxiv.org' in url:
+        if '/abs/' in url:
+            url = url.replace('/abs/', '/pdf/')
+        if not url.endswith('.pdf'):
+            url += '.pdf'
+
+    # Add Jina AI prefix
+    jina_url = f"https://r.jina.ai/{url}"
+
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(jina_url, headers=headers, timeout=10)
         response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching URL {url}: {str(e)}")
+        logging.error(f"Error fetching URL {jina_url}: {str(e)}")
         return f"Couldn't retrieve content from {url}. Error: {str(e)}"
+
+    # If it's a PDF (likely for arXiv papers), return a message
+    if response.headers.get('Content-Type', '').lower() == 'application/pdf':
+        return f"This is a PDF document from {url}. PDF content extraction is not supported in this function."
 
     soup = BeautifulSoup(response.text, 'html.parser')
     
@@ -110,7 +125,7 @@ def process_generic_link(url):
     # Drop blank lines
     text = '\n'.join(chunk for chunk in chunks if chunk)
 
-    if "New Comment Submit" in text: #so tjat the comments are not included
+    if "New Comment Submit" in text: #so that the comments are not included
         text = text[:text.index("New Comment Submit")] 
     return text
 
@@ -302,7 +317,7 @@ def lambda_handler(event, context):
                 text = f'Please first fully understand the following transcript: """{content}""" . Now make a short summary of the transcript and get ready for questions from the user.'
             elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
                 content = process_generic_link(text)
-                text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: {content}"
+                text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n'''{content}'''"
             else:
                 text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
         
