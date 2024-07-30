@@ -165,6 +165,23 @@ def ask_stampy(question):
         logging.error(f"Error querying Stampy: {str(e)}")
         return None
     
+def format_text_response(text):
+    lines = text.split('\n')
+    formatted_text = ""
+    current_indent = 0
+    for line in lines:
+        stripped_line = line.strip()
+        if any(stripped_line.startswith(f"{i}.") for i in range(1, 10)):
+            current_indent = 0
+            formatted_text += '\n' + line + '\n'
+        elif any(stripped_line.startswith(f"{c})") for c in 'abcdefghijklmnopqrstuvwxyz'):
+            current_indent = 3
+            formatted_text += ' ' * current_indent + line + '\n'
+        else:
+            if stripped_line:
+                formatted_text += ' ' * current_indent + line + '\n'
+    return formatted_text.strip()
+
 def generate_uuid(timestamp, text):
     hash_object = hashlib.sha256(f"{timestamp}-{text}".encode('utf-8'))
     return hash_object.hexdigest()
@@ -324,22 +341,19 @@ def lambda_handler(event, context):
                 'statusCode': 200,
                 'body': json.dumps('Sorry, but you first need to register to use this chatbot.')
             }
+        
         if 'voice' in message and message['voice']['mime_type'] == 'audio/ogg': #the user sends an audio
             api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-            # get file path from telegram
             file_id = message['voice']['file_id']
             response = requests.get(api_url + "/getFile", params={"file_id": file_id}).json()
             file_path = response["result"]["file_path"]
             
-            # download the audio file
             audio_data = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}").content
             
-            # save audio data to S3
             audio_file = io.BytesIO(audio_data)
             s3 = boto3.client('s3')
             s3.put_object(Bucket=S3_BUCKET, Key='temp_audio.ogg', Body=audio_file)
 
-            # use AWS Transcribe service
             TranscriptionJob = 'MyTranscriptionJob4Chatbot'+str(int(time.time()))
             transcribe = boto3.client('transcribe')
             transcribe.start_transcription_job(
@@ -349,14 +363,12 @@ def lambda_handler(event, context):
                 LanguageCode='en-US',
             )
 
-            # wait for the job to finish
             while True:
                 status = transcribe.get_transcription_job(TranscriptionJobName=TranscriptionJob)
                 if status['TranscriptionJob']['TranscriptionJobStatus'] in ['COMPLETED', 'FAILED']:
                     break
                 time.sleep(5)
 
-            # get the transcript text from the result
             transcript_url = status['TranscriptionJob']['Transcript']['TranscriptFileUri']
             transcript_result = requests.get(transcript_url).json()
             text = transcript_result['results']['transcripts'][0]['transcript']    
@@ -369,27 +381,47 @@ def lambda_handler(event, context):
         uuid = generate_uuid(timestamp, text)
         print(f"DEBUG: The text received is: {text}")
 
-
-        # print(f"Received message from {chat_id}: {message}")
-        if text[-1].isalpha():  # adding a dot, without a dot ChatGPT will try to complete the sentence.
-            text = text + "."
+        # print(f"DEBUG: Received message from {chat_id}: {message}")
+        # if text[-1].isalpha():  # adding a dot, without a dot ChatGPT will try to complete the sentence.
+        #     text = text + "."
         if text.strip().lower().startswith("/new"):
-            text = text + ". Let's start a new conversation."
+            text = "Let's start a new conversation."
 
-        # Check if the text is a link
-        parsed_url = urlparse(text)
-        if parsed_url.scheme and parsed_url.netloc:
-            if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                content = process_youtube_link(text)
-                text = f'Please first fully understand the following transcript: """{content}""" . Now make a short summary of the transcript and get ready for questions from the user.'
-            elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
-                content = process_generic_link(text)
-                text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n'''{content}'''"
+        # Check if the message is a Stampy command
+        if text.strip().lower().startswith("/stampy"):
+            stampy_query = text[7:].strip()  # Remove "/stampy " from the beginning
+            
+            if not stampy_query: # If there's no query after "/stampy", get the previous user message
+                stampy_query = get_previous_user_message(current_user, S3_BUCKET)
+                if not stampy_query:
+                    send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "No previous question found to ask Stampy.")
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps('No previous question found.')
+                    }
+            
+            # Ask Stampy
+            stampy_response = ask_stampy(stampy_query)
+            if stampy_response:
+                formatted_response = format_text_response(stampy_response)
+                response = f"Stampy's response to '{stampy_query}':\n\n{formatted_response}"
             else:
-                text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
-        
-        response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY)
-        print(f"DEBUG: The response from generate_response is '{response}")
+                response = "Sorry, I couldn't get a response from Stampy."
+        else:
+            # Check if the text is a link
+            parsed_url = urlparse(text)
+            if parsed_url.scheme and parsed_url.netloc:
+                if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
+                    content = process_youtube_link(text)
+                    text = f'Please first fully understand the following transcript: """{content}""" . Now make a short summary of the transcript and get ready for questions from the user.'
+                elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
+                    content = process_generic_link(text)
+                    text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n'''{content}'''"
+                else:
+                    text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
+            
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY)
+            print(f"DEBUG: The response from generate_response is '{response}")
 
         # Check if audio response is enabled and if the response is too long
         audio_warning = ""
@@ -435,7 +467,7 @@ def lambda_handler(event, context):
             'statusCode': 400,
             'body': json.dumps(f'My error: {e}')
         }
-
+    
 #######################################
 def main():
     RESPOND_LAST_N_MESSAGES = 1
