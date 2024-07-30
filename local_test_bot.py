@@ -137,6 +137,33 @@ def process_youtube_link(url):
         return " ".join([entry['text'] for entry in transcript])
     except Exception as e:
         return f"Couldn't retrieve transcript: {str(e)}"
+
+def get_previous_user_message(username, S3_BUCKET):
+    conversation_history = load_conversation_history(username, S3_BUCKET)
+    for message, _ in reversed(conversation_history):
+        if not message.strip().lower().startswith("/"):
+            return message
+    return None
+
+def ask_stampy(question):
+    url = "https://chat.stampy.ai:8443/chat"
+    
+    payload = {
+        "stream": False,
+        "query": question
+    }
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(url, data=json.dumps(payload), headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error querying Stampy: {str(e)}")
+        return None
     
 def generate_uuid(timestamp, text):
     hash_object = hashlib.sha256(f"{timestamp}-{text}".encode('utf-8'))
@@ -287,7 +314,7 @@ def lambda_handler(event, context):
         USERS_ALLOWED = get_parameter(ssm, USERS_ALLOWED_SSM_PATH).split(',')
         AUX_USERNAME = get_parameter(ssm, AUX_USERNAME_SSM_PATH)
 
-        print(f"The event received is: {event}")
+        print(f"DEBUG: The event received is: {event}")
         message = json.loads(event['body'])['message']
         chat_id = message['chat']['id']
         current_user = message['chat']['username']
@@ -297,7 +324,6 @@ def lambda_handler(event, context):
                 'statusCode': 200,
                 'body': json.dumps('Sorry, but you first need to register to use this chatbot.')
             }
-
         if 'voice' in message and message['voice']['mime_type'] == 'audio/ogg': #the user sends an audio
             api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
             # get file path from telegram
@@ -341,7 +367,9 @@ def lambda_handler(event, context):
 
         timestamp = message['date']
         uuid = generate_uuid(timestamp, text)
-        print(f"The text received is: {text}")
+        print(f"DEBUG: The text received is: {text}")
+
+
         # print(f"Received message from {chat_id}: {message}")
         if text[-1].isalpha():  # adding a dot, without a dot ChatGPT will try to complete the sentence.
             text = text + "."
@@ -360,10 +388,8 @@ def lambda_handler(event, context):
             else:
                 text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
         
-
         response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY)
         print(f"DEBUG: The response from generate_response is '{response}")
-
 
         # Check if audio response is enabled and if the response is too long
         audio_warning = ""
@@ -442,4 +468,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
