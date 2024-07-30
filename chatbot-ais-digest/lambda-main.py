@@ -33,6 +33,7 @@ TELEGRAM_BOT_TOKEN_SSM_PATH ='/chatbot-ais-digest/TELEGRAM_BOT_TOKEN_AIS_Digest'
 OPENAI_API_KEY_SSM_PATH = '/chatbot-ais-digest/OPENAI_API_KEY'
 S3_BUCKET_SSM_PATH = '/chatbot-ais-digest/S3_BUCKET'
 USERS_ALLOWED_SSM_PATH = '/chatbot-ais-digest/USERS_ALLOWED'
+AUX_USERNAME_SSM_PATH = '/aux-chatbot-ais-digest/AUX_USERNAME'
 voice_name="Joanna" #"Amy"#"Geraint"#"Joanna"  #to check other premade voices go to https://docs.aws.amazon.com/polly/latest/dg/voicelist.html
 MAX_RESPONSE_LENGTH_AUDIO = 3000  # Adjust as needed for Polly's limitations
 
@@ -87,12 +88,27 @@ def process_generic_link(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
+
+    # Process arXiv URLs
+    if 'arxiv.org' in url:
+        if '/abs/' in url:
+            url = url.replace('/abs/', '/pdf/')
+        if not url.endswith('.pdf'):
+            url += '.pdf'
+
+    # Add Jina AI prefix
+    jina_url = f"https://r.jina.ai/{url}"
+
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(jina_url, headers=headers, timeout=10)
         response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
     except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching URL {url}: {str(e)}")
+        logging.error(f"Error fetching URL {jina_url}: {str(e)}")
         return f"Couldn't retrieve content from {url}. Error: {str(e)}"
+
+    # If it's a PDF (likely for arXiv papers), return a message
+    if response.headers.get('Content-Type', '').lower() == 'application/pdf':
+        return f"This is a PDF document from {url}. PDF content extraction is not supported in this function."
 
     soup = BeautifulSoup(response.text, 'html.parser')
     
@@ -110,7 +126,7 @@ def process_generic_link(url):
     # Drop blank lines
     text = '\n'.join(chunk for chunk in chunks if chunk)
 
-    if "New Comment Submit" in text: #so tjat the comments are not included
+    if "New Comment Submit" in text: #so that the comments are not included
         text = text[:text.index("New Comment Submit")] 
     return text
 
@@ -167,7 +183,7 @@ def generate_response(text, username, S3_BUCKET, OPENAI_API_KEY):
     #     msg = conversation_history.pop(0)
     #     total_length -= len(msg[0]) + len(msg[1])
 
-    print(f">>>>>>>The conversation_history is '{conversation_history}")
+    print(f"DEBUG: The conversation_history is '{conversation_history}")
     prompt = PromptTemplate(input_variables=["conversation_history", "input"], template=prompt_template)
     
     # Use the memory class
@@ -226,19 +242,57 @@ def save_message_to_json(username, message_data, S3_BUCKET):
         logging.warning(f"Message with uuid {uuid} already exists. It will not be written in the userlog.")
 
 
+def get_user_chat_id(user_id):
+    s3_client = boto3.client('s3')
+    bucket_name = 'ais-digest'
+    file_key = f'userlogs/{user_id}.json'
+
+    try:
+        # Retrieve the JSON file from S3
+        response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
+        file_content = response['Body'].read().decode('utf-8')
+        
+        # Parse the JSON content
+        user_data = json.loads(file_content)
+        
+        # Get the first message in the list (assuming the format is consistent)
+        if user_data and len(user_data) > 0:
+            first_message = user_data[0]
+            
+            # Extract the chat ID from the 'chat' field
+            chat_id = first_message.get('chat', {}).get('id')
+            
+            if chat_id:
+                return chat_id
+            else:
+                print(f"Chat ID not found for user {user_id}")
+                return None
+        else:
+            print(f"No messages found for user {user_id}")
+            return None
+    
+    except s3_client.exceptions.NoSuchKey:
+        print(f"No JSON file found for user {user_id}")
+        return None
+    except Exception as e:
+        print(f"Error retrieving chat ID for user {user_id}: {str(e)}")
+        return None
+
 def lambda_handler(event, context):
     try:
         # Load tokens from Parameter Store
         TELEGRAM_BOT_TOKEN = get_parameter(ssm, TELEGRAM_BOT_TOKEN_SSM_PATH)
-        OPENAI_API_KEY= get_parameter(ssm, OPENAI_API_KEY_SSM_PATH)
-        S3_BUCKET= get_parameter(ssm, S3_BUCKET_SSM_PATH)
-        USERS_ALLOWED= get_parameter(ssm, USERS_ALLOWED_SSM_PATH).split(',')
+        OPENAI_API_KEY = get_parameter(ssm, OPENAI_API_KEY_SSM_PATH)
+        S3_BUCKET = get_parameter(ssm, S3_BUCKET_SSM_PATH)
+        USERS_ALLOWED = get_parameter(ssm, USERS_ALLOWED_SSM_PATH).split(',')
+        AUX_USERNAME = get_parameter(ssm, AUX_USERNAME_SSM_PATH)
 
         print(f"The event received is: {event}")
         message = json.loads(event['body'])['message']
         chat_id = message['chat']['id']
         current_user = message['chat']['username']
-        if current_user not in USERS_ALLOWED:
+        
+        if current_user not in USERS_ALLOWED and current_user != AUX_USERNAME:
             return {
                 'statusCode': 200,
                 'body': json.dumps('Sorry, but you first need to register to use this chatbot.')
@@ -302,12 +356,14 @@ def lambda_handler(event, context):
                 text = f'Please first fully understand the following transcript: """{content}""" . Now make a short summary of the transcript and get ready for questions from the user.'
             elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
                 content = process_generic_link(text)
-                text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: {content}"
+                text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n'''{content}'''"
             else:
                 text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
         
 
         response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY)
+        print(f"DEBUG: The response from generate_response is '{response}")
+
 
         # Check if audio response is enabled and if the response is too long
         audio_warning = ""
@@ -317,12 +373,20 @@ def lambda_handler(event, context):
         # Combine the audio warning (if any) with the response
         full_response = response + audio_warning
 
-        # Send the text response
-        send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, full_response)
-
-        # Send audio only if it's enabled and the response is not too long
-        if BOT_AUDIO_RESPONSE and len(response) <= MAX_RESPONSE_LENGTH_AUDIO:
-            send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
+        # Send the response based on the user
+        if current_user == AUX_USERNAME:
+            print(f"DEBUG: The current_user is AUX_USERNAME")
+            for user_id in USERS_ALLOWED:
+                user_chat_id = get_user_chat_id(user_id)
+                if user_chat_id:
+                    print(f"DEBUG: sending the message '{full_response}' to the user_chat_id '{user_chat_id}'")
+                    send_message_to_bot(TELEGRAM_BOT_TOKEN, user_chat_id, full_response)
+                    if BOT_AUDIO_RESPONSE and len(response) <= MAX_RESPONSE_LENGTH_AUDIO:
+                        send_audio_to_bot(TELEGRAM_BOT_TOKEN, user_chat_id, response)
+        else:
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, full_response)
+            if BOT_AUDIO_RESPONSE and len(response) <= MAX_RESPONSE_LENGTH_AUDIO:
+                send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
 
         message_data = {
             "uuid": uuid,
@@ -345,6 +409,4 @@ def lambda_handler(event, context):
             'statusCode': 400,
             'body': json.dumps(f'My error: {e}')
         }
-
-
 
