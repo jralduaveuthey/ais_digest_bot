@@ -17,6 +17,11 @@ import os
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+from bs4 import BeautifulSoup
+import logging
 
 #-------------------BOT SETTINGS-------------------#
 
@@ -84,7 +89,8 @@ class ConversationHistoryMemory(BaseMemory, BaseModel):
         # Append the conversation to the history.
         self.conversation_history.append((input_text, output_text))
 
-def process_generic_link(url):
+
+def process_generic_link(url, max_attempts=5, initial_timeout=5):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -99,12 +105,42 @@ def process_generic_link(url):
     # Add Jina AI prefix
     jina_url = f"https://r.jina.ai/{url}"
 
-    try:
-        response = requests.get(jina_url, headers=headers, timeout=10)
-        response.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xx
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching URL {jina_url}: {str(e)}")
-        return f"Couldn't retrieve content from {url}. Error: {str(e)}"
+    # Set up retry strategy
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    timeout = initial_timeout
+    for attempt in range(max_attempts):
+        try:
+            response = session.get(jina_url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            break  # If successful, break out of the loop
+        except requests.exceptions.Timeout:
+            logging.warning(f"Timeout error for {jina_url} with timeout {timeout}s. Retrying...")
+            timeout += 5  # Increase timeout by 5 seconds for each attempt
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error fetching URL {jina_url}: {str(e)}")
+            
+            # Try direct URL if Jina AI fails
+            try:
+                response = session.get(url, headers=headers, timeout=timeout)
+                response.raise_for_status()
+                break  # If successful, break out of the loop
+            except requests.exceptions.RequestException as e:
+                if attempt == max_attempts - 1:  # If this is the last attempt
+                    return f"Couldn't retrieve content from {url}. Error: {str(e)}"
+                logging.warning(f"Error fetching direct URL {url}: {str(e)}. Retrying...")
+                timeout += 5  # Increase timeout for direct URL attempts as well
+    else:
+        return f"Couldn't retrieve content from {url} after {max_attempts} attempts."
 
     # If it's a PDF (likely for arXiv papers), return a message
     if response.headers.get('Content-Type', '').lower() == 'application/pdf':
