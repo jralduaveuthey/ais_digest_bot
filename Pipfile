@@ -15,6 +15,7 @@ boto3 = "*"
 elevenlabs = "*"
 bs4 = "*"
 youtube-transcript-api = "*"
+langchain-core = "*"
 
 [dev-packages]
 

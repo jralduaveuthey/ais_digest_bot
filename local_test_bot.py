@@ -11,7 +11,7 @@ from langchain import ConversationChain
 from langchain.chat_models import ChatOpenAI
 from langchain.schema import BaseMemory
 from pydantic import BaseModel
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Union, Tuple, Optional, Callable
 from contextlib import closing
 import os
 from bs4 import BeautifulSoup
@@ -22,8 +22,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from bs4 import BeautifulSoup
 import logging
+import tiktoken
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 
 #-------------------BOT SETTINGS-------------------#
+
+DEFAULT_MODEL = "gpt-4o-mini"  # Use this as a fallback
+MAX_TOKENS = 128000  # For GPT-4o-mini, the maximum token limit is 128,000 tokens
+DEFAULT_ENCODING = "cl100k_base"  # This is used by gpt-3.5-turbo and gpt-4
 
 prompt_template = """The following is a friendly conversation between a human and an AI. 
     The AI is talkative and provides lots of specific details from its context. 
@@ -253,32 +259,138 @@ def send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
         # Optionally, send a message to the user about the audio error
         send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "<Sorry, there was an error sending the audio version of the message.>")
 
-def generate_response(text, username, S3_BUCKET, OPENAI_API_KEY):
-    # Load conversation history from the JSON file
+
+def get_encoding(model_name: str):
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        print(f"Warning: Model '{model_name}' not found. Using cl100k_base encoding.")
+        return tiktoken.get_encoding("cl100k_base")
+
+def num_tokens_from_messages(messages: List[Union[BaseMessage, Tuple[str, str]]], model_name: str) -> int:
+    encoding = get_encoding(model_name)
+    num_tokens = 0
+    for message in messages:
+        num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
+        if isinstance(message, BaseMessage):
+            content = message.content
+            if isinstance(message, SystemMessage):
+                role = "system"
+            elif isinstance(message, HumanMessage):
+                role = "user"
+            elif isinstance(message, AIMessage):
+                role = "assistant"
+            else:
+                role = "user"  # default to user for unknown message types
+        elif isinstance(message, tuple):
+            user_message, ai_response = message
+        else:
+            raise ValueError(f"Unsupported message type: {type(message)}")
+        
+        num_tokens += len(encoding.encode(user_message))
+        num_tokens += len(encoding.encode(ai_response))
+    num_tokens += 2  # every reply is primed with <im_start>assistant
+    return num_tokens
+
+def trim_messages(
+    messages: List[BaseMessage],
+    max_tokens: int,
+    token_counter: Callable[[List[BaseMessage]], int],
+    strategy: str = "last",
+    include_system: bool = True,
+) -> List[BaseMessage]:
+    if strategy not in ["last", "first"]:
+        raise ValueError(f"Invalid strategy: {strategy}")
+    
+    system_message = next((m for m in messages if isinstance(m, SystemMessage)), None)
+    non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
+    
+    if include_system and system_message:
+        max_tokens -= token_counter([system_message])
+    
+    while token_counter(non_system_messages) > max_tokens:
+        if strategy == "last":
+            non_system_messages.pop(0)
+        else:
+            non_system_messages.pop()
+    
+    if include_system and system_message:
+        return [system_message] + non_system_messages
+    return non_system_messages
+
+def split_context(context: str, model_name: str, max_tokens: int = MAX_TOKENS) -> List[str]:
+    """Splits the context into chunks that are smaller than the max token limit."""
+    encoding = get_encoding(model_name)
+    tokens = encoding.encode(context)
+    chunks = []
+    current_chunk = []
+
+    for token in tokens:
+        current_chunk.append(token)
+        if len(current_chunk) >= max_tokens - 1000:  # Leave some room for the response
+            chunks.append(encoding.decode(current_chunk))
+            current_chunk = []
+
+    if current_chunk:
+        chunks.append(encoding.decode(current_chunk))
+
+    return chunks
+
+def process_chunks(chunks: List[str], conversation: ConversationChain, TELEGRAM_BOT_TOKEN: str, chat_id: int) -> str:
+    """Processes each chunk and returns the final response."""
+    responses = []
+    for i, chunk in enumerate(chunks):
+        response = conversation.predict(input=f"Chunk {i+1}/{len(chunks)}: {chunk}")
+        responses.append(response)
+        
+        # Send a progress update to the user
+        progress_message = f"Processing chunk {i+1} of {len(chunks)}..."
+        send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, progress_message)
+
+    final_response = "\n\n".join(responses)
+    return final_response
+
+
+def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
+    try:
+        return conversation.predict(input=text)
+    except Exception as e:
+        if "maximum context length" in str(e).lower():
+            warning_message = ("The context was too long. Trimming conversation history to fit within the token limit.")
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, warning_message)
+            
+            # Get all messages including conversation history
+            all_messages = conversation.memory.conversation_history + [HumanMessage(content=text)]
+            
+            # Trim messages
+            trimmed_messages = trim_messages(
+                all_messages,
+                max_tokens=MAX_TOKENS - 1000,  # Leave some room for the response
+                token_counter=lambda msgs: num_tokens_from_messages(msgs, model_name),
+                strategy="last",
+                include_system=True
+            )
+            
+            # Update conversation memory with trimmed messages
+            conversation.memory.conversation_history = trimmed_messages[:-1]  # Exclude the last message (current input)
+            
+            # Try predicting with trimmed messages
+            return conversation.predict(input=text)
+        else:
+            raise e
+
+def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
     conversation_history = load_conversation_history(username, S3_BUCKET)
-
-    # # Update conversation_history to keep only the messages containing the last 3000 charachters...so it does not hit token limit and so that it is cheaper
-    # total_length = sum(len(x[0]) + len(x[1]) for x in conversation_history)# calculate the total length
-    # while total_length > 3000:# keep popping from the front of the list until total length <= 3000
-    #     msg = conversation_history.pop(0)
-    #     total_length -= len(msg[0]) + len(msg[1])
-
-    print(f"DEBUG: The conversation_history is '{conversation_history}")
     prompt = PromptTemplate(input_variables=["conversation_history", "input"], template=prompt_template)
     
-    # Use the memory class
     conversation = ConversationChain(
-        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name='gpt-4o-mini'), 
+        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name), 
         prompt=prompt, 
         verbose=True, 
         memory=ConversationHistoryMemory(conversation_history=conversation_history)
     )
-    if "New Comment Submit" in text:
-        text = text[:text.index("New Comment Submit")]
-        text = text.strip()
-    # response = conversation.predict(input="what is my name?")
-    response = conversation.predict(input=text)
-    return response
+
+    return handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, model_name)
 
 def load_conversation_history(username, S3_BUCKET):
     filename = f"userlogs/{username}.json"
@@ -289,8 +401,9 @@ def load_conversation_history(username, S3_BUCKET):
         
         # Find the index of the last "/new" message
         last_new_index = -1
-        for i, (text, _) in enumerate(reversed(full_history)):
-            if text.strip().lower().startswith("/new"):
+        for i, (text, _) in enumerate(reversed(full_history)): #/new or "Let's start a new conversation."
+            if text.strip().lower().startswith("/new") or ("Let's start a new conversation." in text):
+
                 last_new_index = len(full_history) - i - 1
                 break
         
@@ -456,7 +569,10 @@ def lambda_handler(event, context):
                 else:
                     text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
             
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY)
+            model_name = 'gpt-4o-mini'  # or whatever model name you're using
+            text = "Check in our previous conversation and " + text
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name)
+
             print(f"DEBUG: The response from generate_response is '{response}")
 
         # Check if audio response is enabled and if the response is too long
