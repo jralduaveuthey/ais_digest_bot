@@ -7,7 +7,6 @@ from langchain import PromptTemplate, ConversationChain
 import requests
 from datetime import datetime
 import hashlib
-from langchain import ConversationChain
 from langchain.chat_models import ChatOpenAI
 from langchain.schema import BaseMemory
 from pydantic import BaseModel
@@ -376,6 +375,8 @@ def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat
             
             # Try predicting with trimmed messages
             return conversation.predict(input=text)
+        elif "You exceeded your current quota, please check your plan and billing details." in str(e):
+            return "Sorry, I'm currently out of credits. Please try again later."
         else:
             raise e
 
@@ -384,7 +385,7 @@ def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: 
     prompt = PromptTemplate(input_variables=["conversation_history", "input"], template=prompt_template)
     
     conversation = ConversationChain(
-        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name), 
+        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name, max_retries=1), 
         prompt=prompt, 
         verbose=True, 
         memory=ConversationHistoryMemory(conversation_history=conversation_history)
@@ -471,6 +472,7 @@ def get_user_chat_id(user_id):
         print(f"Error retrieving chat ID for user {user_id}: {str(e)}")
         return None
 
+
 def lambda_handler(event, context):
     try:
         # Load tokens from Parameter Store
@@ -482,16 +484,43 @@ def lambda_handler(event, context):
 
         print(f"DEBUG: The event received is: {event}")
         message = json.loads(event['body'])['message']
-        chat_id = message['chat']['id']
-        current_user = message['chat']['username']
         
-        if current_user not in USERS_ALLOWED and current_user != AUX_USERNAME:
+        chat_id = message['chat'].get('id')
+        print(f"DEBUG: The chat_id is '{chat_id}'")
+        chat_type = message['chat'].get('type')
+        print(f"DEBUG: The chat_type is '{chat_type}'")
+        current_user = message['from'].get('username')
+        print(f"DEBUG: The current_user is '{current_user}'")
+        current_first_name = message['from'].get('first_name')
+        print(f"DEBUG: The current_first_name is '{current_first_name}'")
+        
+        # Check if the message is from a private chat
+        if chat_type != 'private':
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, f"Sorry, but I cannot work yet with chat type: '{chat_type}'. Please use me in a private chat.")
             return {
                 'statusCode': 200,
-                'body': json.dumps('Sorry, but you first need to register to use this chatbot.')
+                'body': json.dumps(f'Message sent: Bot not configured for {chat_type} chats.')
             }
         
-        if 'voice' in message and message['voice']['mime_type'] == 'audio/ogg': #the user sends an audio
+        if not current_user and not current_first_name:
+            error_message = "Error: Unable to identify the user. Please make sure you have a username set in Telegram or that your first name is set."
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, error_message)
+            return {
+                'statusCode': 400,
+                'body': json.dumps('Error: Unable to identify the user.')
+            }
+        
+        if current_first_name and not current_user:
+            current_user = current_first_name.lower() #TODO: fix this because this is only a patch for the case when the user does not have a username set in Telegram but it has a first name
+        
+        if (current_user not in USERS_ALLOWED)  and (current_user != AUX_USERNAME):
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, 'Sorry, but you first need to register to use this chatbot. Your current_user is {current_user}; your current_first_name is {current_first_name}; and the USERS_ALLOWED are {USERS_ALLOWED}.')
+            return {
+                'statusCode': 200,
+                'body': json.dumps('User not registered.')
+            }
+
+        if 'voice' in message and message['voice']['mime_type'] == 'audio/ogg':
             api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
             file_id = message['voice']['file_id']
             response = requests.get(api_url + "/getFile", params={"file_id": file_id}).json()
@@ -523,24 +552,20 @@ def lambda_handler(event, context):
             text = transcript_result['results']['transcripts'][0]['transcript']    
             send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, f"My transcript of your audio is: {text}")
 
-        else: #the user typed something
+        else:
             text = message['text']
 
         timestamp = message['date']
         uuid = generate_uuid(timestamp, text)
         print(f"DEBUG: The text received is: {text}")
 
-        # print(f"DEBUG: Received message from {chat_id}: {message}")
-        # if text[-1].isalpha():  # adding a dot, without a dot ChatGPT will try to complete the sentence.
-        #     text = text + "."
         if text.strip().lower().startswith("/new"):
             text = "Let's start a new conversation."
 
-        # Check if the message is a Stampy command
         if text.strip().lower().startswith("/stampy"):
-            stampy_query = text[7:].strip()  # Remove "/stampy " from the beginning
+            stampy_query = text[7:].strip()
             
-            if not stampy_query: # If there's no query after "/stampy", get the previous user message
+            if not stampy_query:
                 stampy_query = get_previous_user_message(current_user, S3_BUCKET)
                 if not stampy_query:
                     send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "No previous question found to ask Stampy.")
@@ -549,7 +574,6 @@ def lambda_handler(event, context):
                         'body': json.dumps('No previous question found.')
                     }
             
-            # Ask Stampy
             stampy_response = ask_stampy(stampy_query)
             if stampy_response:
                 formatted_response = format_text_response(stampy_response)
@@ -557,7 +581,6 @@ def lambda_handler(event, context):
             else:
                 response = "Sorry, I couldn't get a response from Stampy."
         else:
-            # Check if the text is a link
             parsed_url = urlparse(text)
             if parsed_url.scheme and parsed_url.netloc:
                 if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
@@ -569,21 +592,18 @@ def lambda_handler(event, context):
                 else:
                     text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
             
-            model_name = 'gpt-4o-mini'  # or whatever model name you're using
+            model_name = 'gpt-4o-mini'
             text = "Check in our previous conversation and " + text
             response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name)
 
             print(f"DEBUG: The response from generate_response is '{response}")
 
-        # Check if audio response is enabled and if the response is too long
         audio_warning = ""
         if BOT_AUDIO_RESPONSE and len(response) > MAX_RESPONSE_LENGTH_AUDIO:
             audio_warning = "<The text is too long so it will not be sent as audio...>\n\n"
 
-        # Combine the audio warning (if any) with the response
         full_response = response + audio_warning
 
-        # Send the response based on the user
         if current_user == AUX_USERNAME:
             print(f"DEBUG: The current_user is AUX_USERNAME")
             for user_id in USERS_ALLOWED:
@@ -613,10 +633,22 @@ def lambda_handler(event, context):
             'statusCode': 200,
             'body': json.dumps('Lambda finished OK.')
         }
-    except Exception as e:
-        logging.error(str(e))
+    except KeyError as e:
+        error_message = f"Error: Missing required field in the message: {str(e)}"
+        print(f"DEBUG: {error_message}")
+        if 'chat_id' in locals():
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, error_message)
         return {
             'statusCode': 400,
-            'body': json.dumps(f'My error: {e}')
+            'body': json.dumps(error_message)
         }
-    
+    except Exception as e:
+        error_message = f"An unexpected error occurred: {str(e)}"
+        print(f"DEBUG: {error_message}")
+        if 'chat_id' in locals():
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, error_message)
+        return {
+            'statusCode': 500,
+            'body': json.dumps(error_message)
+        }
+
