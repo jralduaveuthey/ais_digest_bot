@@ -15,7 +15,7 @@ from contextlib import closing
 import os
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
@@ -171,8 +171,18 @@ def process_generic_link(url, max_attempts=5, initial_timeout=5):
         text = text[:text.index("New Comment Submit")] 
     return text
 
-def process_youtube_link(url):
-    video_id = url.split("v=")[1]
+def process_youtube_link(parsed_url):
+    if 'youtube.com' in parsed_url.netloc:
+        query = parse_qs(parsed_url.query)
+        video_id = query.get('v', [None])[0]
+    elif 'youtu.be' in parsed_url.netloc:
+        video_id = parsed_url.path.lstrip('/')
+    else:
+        return "Not a valid YouTube URL"
+    
+    if not video_id:
+        return "Couldn't extract video ID"
+    
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         return " ".join([entry['text'] for entry in transcript])
@@ -387,6 +397,7 @@ def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: 
     conversation = ConversationChain(
         llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name, max_retries=1), 
         prompt=prompt, 
+
         verbose=True, 
         memory=ConversationHistoryMemory(conversation_history=conversation_history)
     )
@@ -403,8 +414,7 @@ def load_conversation_history(username, S3_BUCKET):
         # Find the index of the last "/new" message
         last_new_index = -1
         for i, (text, _) in enumerate(reversed(full_history)): #/new or "Let's start a new conversation."
-            if text.strip().lower().startswith("/new") or ("Let's start a new conversation." in text):
-
+            if "/new" in text:
                 last_new_index = len(full_history) - i - 1
                 break
         
@@ -475,6 +485,8 @@ def get_user_chat_id(user_id):
 
 def lambda_handler(event, context):
     try:
+        MODEL_NAME = 'gpt-4o-mini'
+
         # Load tokens from Parameter Store
         TELEGRAM_BOT_TOKEN = get_parameter(ssm, TELEGRAM_BOT_TOKEN_SSM_PATH)
         OPENAI_API_KEY = get_parameter(ssm, OPENAI_API_KEY_SSM_PATH)
@@ -514,7 +526,7 @@ def lambda_handler(event, context):
             current_user = current_first_name.lower() #TODO: fix this because this is only a patch for the case when the user does not have a username set in Telegram but it has a first name
         
         if (current_user not in USERS_ALLOWED)  and (current_user != AUX_USERNAME):
-            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, 'Sorry, but you first need to register to use this chatbot. Your current_user is {current_user}; your current_first_name is {current_first_name}; and the USERS_ALLOWED are {USERS_ALLOWED}.')
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, f"Sorry, but you first need to register to use this chatbot. Your current_user is {current_user}; your current_first_name is {current_first_name}; and the USERS_ALLOWED are {USERS_ALLOWED}.")
             return {
                 'statusCode': 200,
                 'body': json.dumps('User not registered.')
@@ -560,9 +572,9 @@ def lambda_handler(event, context):
         print(f"DEBUG: The text received is: {text}")
 
         if text.strip().lower().startswith("/new"):
-            text = "Let's start a new conversation."
-
-        if text.strip().lower().startswith("/stampy"):
+            text = "(/new) Let's start a new conversation."
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+        elif text.strip().lower().startswith("/stampy"):
             stampy_query = text[7:].strip()
             
             if not stampy_query:
@@ -580,23 +592,26 @@ def lambda_handler(event, context):
                 response = f"Stampy's response to '{stampy_query}':\n\n{formatted_response}"
             else:
                 response = "Sorry, I couldn't get a response from Stampy."
-        else:
+        elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
             parsed_url = urlparse(text)
             if parsed_url.scheme and parsed_url.netloc:
                 if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                    content = process_youtube_link(text)
-                    text = f'Please first fully understand the following transcript: """{content}""" . Now make a short summary of the transcript and get ready for questions from the user.'
+                    content = process_youtube_link(parsed_url)
+                    text = f'Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
                 elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
                     content = process_generic_link(text)
                     text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n'''{content}'''"
                 else:
                     text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
             
-            model_name = 'gpt-4o-mini'
-            text = "Check in our previous conversation and " + text
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name)
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+        else: 
+            text = f"Check in our previous conversation and return: '{text}'"
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
 
-            print(f"DEBUG: The response from generate_response is '{response}")
+
+
+        print(f"DEBUG: The response from generate_response is '{response}")
 
         audio_warning = ""
         if BOT_AUDIO_RESPONSE and len(response) > MAX_RESPONSE_LENGTH_AUDIO:
