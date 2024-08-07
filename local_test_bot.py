@@ -95,7 +95,7 @@ class ConversationHistoryMemory(BaseMemory, BaseModel):
         self.conversation_history.append((input_text, output_text))
 
 
-def process_generic_link(url, max_attempts=5, initial_timeout=5):
+def process_generic_link(url, max_attempts=5, initial_timeout=5, transcript_only=False):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -169,9 +169,12 @@ def process_generic_link(url, max_attempts=5, initial_timeout=5):
 
     if "New Comment Submit" in text: #so that the comments are not included
         text = text[:text.index("New Comment Submit")] 
+
+    if transcript_only and len(text) > 4000:
+        return jina_url
     return text
 
-def process_youtube_link(parsed_url):
+def process_youtube_link(parsed_url, transcript_only=False):
     if 'youtube.com' in parsed_url.netloc:
         query = parse_qs(parsed_url.query)
         video_id = query.get('v', [None])[0]
@@ -185,10 +188,14 @@ def process_youtube_link(parsed_url):
     
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join([entry['text'] for entry in transcript])
+        transcript_text = " ".join([entry['text'] for entry in transcript])
+        
+        if transcript_only and len(transcript_text) > 4000:
+            return transcript_text[:4000]
+        
+        return transcript_text
     except Exception as e:
         return f"Couldn't retrieve transcript: {str(e)}"
-
 def get_previous_user_message(username, S3_BUCKET):
     conversation_history = load_conversation_history(username, S3_BUCKET)
     for message, _ in reversed(conversation_history):
@@ -359,7 +366,6 @@ def process_chunks(chunks: List[str], conversation: ConversationChain, TELEGRAM_
     final_response = "\n\n".join(responses)
     return final_response
 
-
 def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
     try:
         return conversation.predict(input=text)
@@ -368,10 +374,8 @@ def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat
             warning_message = ("The context was too long. Trimming conversation history to fit within the token limit.")
             send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, warning_message)
             
-            # Get all messages including conversation history
             all_messages = conversation.memory.conversation_history + [HumanMessage(content=text)]
             
-            # Trim messages
             trimmed_messages = trim_messages(
                 all_messages,
                 max_tokens=MAX_TOKENS - 1000,  # Leave some room for the response
@@ -380,10 +384,8 @@ def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat
                 include_system=True
             )
             
-            # Update conversation memory with trimmed messages
             conversation.memory.conversation_history = trimmed_messages[:-1]  # Exclude the last message (current input)
             
-            # Try predicting with trimmed messages
             return conversation.predict(input=text)
         elif "You exceeded your current quota, please check your plan and billing details." in str(e):
             return "Sorry, I'm currently out of credits. Please try again later."
@@ -397,7 +399,6 @@ def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: 
     conversation = ConversationChain(
         llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name, max_retries=1), 
         prompt=prompt, 
-
         verbose=True, 
         memory=ConversationHistoryMemory(conversation_history=conversation_history)
     )
@@ -411,14 +412,12 @@ def load_conversation_history(username, S3_BUCKET):
         data = json.loads(response['Body'].read().decode('utf-8'))
         full_history = [(item['text'], item['response']) for item in data]
         
-        # Find the index of the last "/new" message
         last_new_index = -1
-        for i, (text, _) in enumerate(reversed(full_history)): #/new or "Let's start a new conversation."
+        for i, (text, _) in enumerate(reversed(full_history)):
             if "/new" in text:
                 last_new_index = len(full_history) - i - 1
                 break
         
-        # If "/new" was found, return the history after it, otherwise return the full history
         return full_history[last_new_index + 1:] if last_new_index != -1 else full_history
     except Exception as e:
         print(f"WARNING: in load_conversation_history() there was an error: '{e}'")
@@ -445,25 +444,18 @@ def save_message_to_json(username, message_data, S3_BUCKET):
     else:
         logging.warning(f"Message with uuid {uuid} already exists. It will not be written in the userlog.")
 
-
 def get_user_chat_id(user_id):
     s3_client = boto3.client('s3')
     bucket_name = 'ais-digest'
     file_key = f'userlogs/{user_id}.json'
 
     try:
-        # Retrieve the JSON file from S3
         response = s3_client.get_object(Bucket=bucket_name, Key=file_key)
         file_content = response['Body'].read().decode('utf-8')
-        
-        # Parse the JSON content
         user_data = json.loads(file_content)
         
-        # Get the first message in the list (assuming the format is consistent)
         if user_data and len(user_data) > 0:
             first_message = user_data[0]
-            
-            # Extract the chat ID from the 'chat' field
             chat_id = first_message.get('chat', {}).get('id')
             
             if chat_id:
@@ -482,6 +474,12 @@ def get_user_chat_id(user_id):
         print(f"Error retrieving chat ID for user {user_id}: {str(e)}")
         return None
 
+def get_previous_url(username, S3_BUCKET):
+    conversation_history = load_conversation_history(username, S3_BUCKET)
+    for message, _ in reversed(conversation_history):
+        if message.strip().lower().startswith("http") or message.strip().lower().startswith("www"):
+            return message.strip().split('\n')[0]  # Return the message till the first newline
+    return None
 
 def lambda_handler(event, context):
     try:
@@ -525,7 +523,7 @@ def lambda_handler(event, context):
         if current_first_name and not current_user:
             current_user = current_first_name.lower() #TODO: fix this because this is only a patch for the case when the user does not have a username set in Telegram but it has a first name
         
-        if (current_user not in USERS_ALLOWED)  and (current_user != AUX_USERNAME):
+        if (current_user not in USERS_ALLOWED) and (current_user != AUX_USERNAME):
             send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, f"Sorry, but you first need to register to use this chatbot. Your current_user is {current_user}; your current_first_name is {current_first_name}; and the USERS_ALLOWED are {USERS_ALLOWED}.")
             return {
                 'statusCode': 200,
@@ -592,15 +590,32 @@ def lambda_handler(event, context):
                 response = f"Stampy's response to '{stampy_query}':\n\n{formatted_response}"
             else:
                 response = "Sorry, I couldn't get a response from Stampy."
+        elif text.strip().lower().startswith("/transcript"):
+            previous_url = get_previous_url(current_user, S3_BUCKET)
+            if previous_url:
+                parsed_url = urlparse(previous_url)
+                if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
+                    content = process_youtube_link(parsed_url, transcript_only=True)
+                    response = f"Here's the transcript of the video:\n\n{content}"
+                else:
+                    content = process_generic_link(previous_url, transcript_only=True)
+                    response = f"Here's the transcript of the content:\n\n{content}"
+            else:
+                response = "No previous URL found. Please provide a YouTube URL for transcription."
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Transcript request processed.')
+            }
         elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
             parsed_url = urlparse(text)
             if parsed_url.scheme and parsed_url.netloc:
                 if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
                     content = process_youtube_link(parsed_url)
-                    text = f'Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
+                    text = f'{text} \n Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
                 elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
                     content = process_generic_link(text)
-                    text = f"Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n'''{content}'''"
+                    text = f'{text} \n Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n"""{content}"""'
                 else:
                     text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
             
@@ -608,8 +623,6 @@ def lambda_handler(event, context):
         else: 
             text = f"Check in our previous conversation and return: '{text}'"
             response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-
-
 
         print(f"DEBUG: The response from generate_response is '{response}")
 
@@ -666,6 +679,7 @@ def lambda_handler(event, context):
             'statusCode': 500,
             'body': json.dumps(error_message)
         }
+
 
 #######################################
 def main():
