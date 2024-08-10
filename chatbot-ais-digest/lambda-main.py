@@ -12,11 +12,9 @@ from langchain.schema import BaseMemory
 from pydantic import BaseModel
 from typing import List, Dict, Any, Union, Tuple, Optional, Callable
 from contextlib import closing
-import os
 from bs4 import BeautifulSoup
 from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
-import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from bs4 import BeautifulSoup
@@ -43,7 +41,9 @@ TELEGRAM_BOT_TOKEN_SSM_PATH ='/chatbot-ais-digest/TELEGRAM_BOT_TOKEN_AIS_Digest'
 OPENAI_API_KEY_SSM_PATH = '/chatbot-ais-digest/OPENAI_API_KEY'
 S3_BUCKET_SSM_PATH = '/chatbot-ais-digest/S3_BUCKET'
 USERS_ALLOWED_SSM_PATH = '/chatbot-ais-digest/USERS_ALLOWED'
+RAPIDAPI_KEY_SSM_PATH = '/chatbot-ais-digest/RAPIDAPI_KEY'
 AUX_USERNAME_SSM_PATH = '/aux-chatbot-ais-digest/AUX_USERNAME'
+
 voice_name="Joanna" #"Amy"#"Geraint"#"Joanna"  #to check other premade voices go to https://docs.aws.amazon.com/polly/latest/dg/voicelist.html
 MAX_RESPONSE_LENGTH_AUDIO = 3000  # Adjust as needed for Polly's limitations
 
@@ -174,7 +174,7 @@ def process_generic_link(url, max_attempts=5, initial_timeout=5, transcript_only
         return jina_url
     return text
 
-def process_youtube_link(parsed_url, transcript_only=False):
+def process_youtube_link(parsed_url, RAPIDAPI_KEY="", transcript_only=False):
     if 'youtube.com' in parsed_url.netloc:
         query = parse_qs(parsed_url.query)
         video_id = query.get('v', [None])[0]
@@ -187,15 +187,45 @@ def process_youtube_link(parsed_url, transcript_only=False):
         return "Couldn't extract video ID"
     
     try:
+        # Attempt to retrieve the transcript using YouTubeTranscriptApi
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         transcript_text = " ".join([entry['text'] for entry in transcript])
         
         if transcript_only and len(transcript_text) > 4000:
-            return transcript_text[:4000]
-        
+            return f"<showing only the first 4000 characters from '{len(transcript_text)}>: " + transcript_text[:4000]
+        print(f"DEBUG Success fetching transcript using YouTubeTranscriptApi: {transcript_text[:100]}...")
         return transcript_text
+
     except Exception as e:
-        return f"Couldn't retrieve transcript: {str(e)}"
+        print(f"DEBUG error using YouTubeTranscriptApi: {str(e)}")
+        
+        # If it fails, try the alternative method using RapidAPI
+        url = "https://youtube-transcripts.p.rapidapi.com/youtube/transcript"
+        querystring = {"url": f"https://youtu.be/{video_id}", "chunkSize": "500"}
+        headers = {
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": "youtube-transcripts.p.rapidapi.com"
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=querystring)
+            response.raise_for_status()  # Raise an error for bad responses
+            
+            # Check if the response contains transcript data
+            if response.json():
+                transcript_data = response.json()
+                transcript_text = " ".join([entry['text'] for entry in transcript_data['content']])
+                
+                if transcript_only and len(transcript_text) > 4000:
+                    return f"<showing only the first 4000 characters from '{len(transcript_text)}>: " + transcript_text[:4000]
+                print(f"DEBUG Success fetching transcript from RapidAPI: {transcript_text[:100]}...")
+                return transcript_text
+            
+        except Exception as e:
+            print(f"DEBUG error fetching transcript from RapidAPI: {str(e)}")
+            return "Couldn't retrieve transcript using both methods."
+        
+
 def get_previous_user_message(username, S3_BUCKET):
     conversation_history = load_conversation_history(username, S3_BUCKET)
     for message, _ in reversed(conversation_history):
@@ -491,6 +521,7 @@ def lambda_handler(event, context):
         S3_BUCKET = get_parameter(ssm, S3_BUCKET_SSM_PATH)
         USERS_ALLOWED = get_parameter(ssm, USERS_ALLOWED_SSM_PATH).split(',')
         AUX_USERNAME = get_parameter(ssm, AUX_USERNAME_SSM_PATH)
+        RAPIDAPI_KEY = get_parameter(ssm, RAPIDAPI_KEY_SSM_PATH)
 
         print(f"DEBUG: The event received is: {event}")
         message = json.loads(event['body'])['message']
@@ -648,7 +679,7 @@ def lambda_handler(event, context):
             if previous_url:
                 parsed_url = urlparse(previous_url)
                 if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                    content = process_youtube_link(parsed_url, transcript_only=True)
+                    content = process_youtube_link(parsed_url, RAPIDAPI_KEY,  transcript_only=True)
                     response = f"Here's the transcript of the video:\n\n{content}"
                 else:
                     content = process_generic_link(previous_url, transcript_only=True)
@@ -662,9 +693,11 @@ def lambda_handler(event, context):
             }
         elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
             parsed_url = urlparse(text)
+            print(f"DEBUG: The parsed_url that will be passed for the normal processing is '{parsed_url}'")
+            print(f"DEBUG: The parsed_url.netloc that will be used for the normal processing is '{parsed_url.netloc}'")
             if parsed_url.scheme and parsed_url.netloc:
                 if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                    content = process_youtube_link(parsed_url)
+                    content = process_youtube_link(parsed_url, RAPIDAPI_KEY)
                     text = f'{text} \n Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
                 elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
                     content = process_generic_link(text)
