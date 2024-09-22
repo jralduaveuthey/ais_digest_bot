@@ -23,6 +23,16 @@ import tiktoken
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 
 #-------------------BOT SETTINGS-------------------#
+"""
+List of bot commands:
+/new - Start new conversation
+/stampy - Ask question to Stampy (stampy.ai/chat/)
+/transcript - Returns transcript or jina link
+/exam - Check your understanding
+/reflect - Solo Reflection
+/journal - Private journaling
+/journalgpt - Journal with AI assistant
+"""
 
 DEFAULT_MODEL = "gpt-4o-mini"  # Use this as a fallback
 MAX_TOKENS = 128000  # For GPT-4o-mini, the maximum token limit is 128,000 tokens
@@ -62,7 +72,8 @@ ssm = boto3.client('ssm', region_name=region)  # Adjust the region as needed.
 s3_client = boto3.client('s3', region_name=region)
 polly = boto3.client('polly')
 
-
+JOURNAL_FILE = "userlogs/journal.json"
+JOURNALGPT_FILE = "userlogs/journalgpt.json"
 
 class ConversationHistoryMemory(BaseMemory, BaseModel):
     """Memory class for storing conversation history."""
@@ -94,6 +105,81 @@ class ConversationHistoryMemory(BaseMemory, BaseModel):
         # Append the conversation to the history.
         self.conversation_history.append((input_text, output_text))
 
+def save_journal_entry(entry, S3_BUCKET, journal_type):
+    filename = JOURNAL_FILE if journal_type == "journal" else JOURNALGPT_FILE
+    try:
+        try:
+            # Try to get the existing file
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+        except s3_client.exceptions.NoSuchKey:
+            # If the file doesn't exist, create an empty list
+            data = []
+
+        timestamp = int(time.time())
+        entry_data = {
+            "timestamp": timestamp,
+            "human_readable_date": datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+            "entry": entry
+        }
+        data.append(entry_data)
+
+        # Save the updated data back to S3
+        s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=json.dumps(data))
+        
+        print(f"Journal entry saved successfully to {filename}")
+    except Exception as e:
+        logging.error(f"Error saving journal entry: {str(e)}")
+        print(f"Error saving journal entry: {str(e)}")
+
+def is_in_journalgpt_mode(username, S3_BUCKET):
+    conversation_history = load_conversation_history(username, S3_BUCKET)
+    for message, _ in reversed(conversation_history):
+        if message.strip().lower() == "/journalgpt":
+            return True
+        elif message.strip().lower().startswith("/"):
+            return False
+    return False
+
+def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name):
+    journalgpt_prompt_template = """You are an AI coach assistant for journaling. Your role is to provide supportive, 
+    insightful, and thought-provoking responses to the user's journal entries. Encourage self-reflection, personal growth, 
+    and emotional awareness. Be empathetic and non-judgmental in your responses. If appropriate, you may ask follow-up 
+    questions to help the user explore their thoughts and feelings more deeply.
+
+    Here is the conversation history:
+    {conversation_history}
+
+    Human: {input}
+    AI Coach:"""
+
+    prompt = PromptTemplate(input_variables=["conversation_history", "input"], template=journalgpt_prompt_template)
+    
+    conversation_history = load_conversation_history(username, S3_BUCKET)
+    journalgpt_history = []
+    for message, response in reversed(conversation_history):
+        if message.strip().lower() == "/journalgpt":
+            break
+        journalgpt_history.insert(0, (message, response))
+
+    conversation = ConversationChain(
+        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name, max_retries=1), 
+        prompt=prompt, 
+        verbose=True, 
+        memory=ConversationHistoryMemory(conversation_history=journalgpt_history)
+    )
+
+    return handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, model_name)
+
+
+def is_in_journal_mode(username, S3_BUCKET):
+    conversation_history = load_conversation_history(username, S3_BUCKET)
+    for message, _ in reversed(conversation_history):
+        if message.strip().lower() == "/journal":
+            return True
+        elif message.strip().lower().startswith("/"):
+            return False
+    return False
 
 def process_generic_link(url, max_attempts=5, initial_timeout=5, transcript_only=False):
     headers = {
@@ -600,7 +686,32 @@ def lambda_handler(event, context):
         uuid = generate_uuid(timestamp, text)
         print(f"DEBUG: The text received is: {text}")
 
-        if text.strip().lower().startswith("/new"):
+        # Check for any link starting with "https" in the text
+        https_links = [word for word in text.split() if word.startswith("https://")]
+        if https_links:
+            # If there are https links, keep only the first one
+            text = https_links[0]
+        else:
+            # If no https links are found, proceed as normal
+            pass
+        
+        if text.strip().lower() == "/journal":
+            response = "Journal mode activated. Your subsequent messages will be saved as journal entries. Use /new to exit journal mode."
+        elif is_in_journal_mode(current_user, S3_BUCKET):
+            if text.strip().lower() == "/new":
+                response = "Journal mode deactivated. Your messages will now be processed normally."
+            else:
+                save_journal_entry(text, S3_BUCKET, "journal")
+                response = "Your journal entry has been saved."
+        elif text.strip().lower() == "/journalgpt":
+            response = "JournalGPT mode activated. You're now in a conversation with an AI coach journaling assistant. Use /new to exit JournalGPT mode."
+        elif is_in_journalgpt_mode(current_user, S3_BUCKET):
+            if text.strip().lower() == "/new":
+                response = "JournalGPT mode deactivated. Your messages will now be processed normally."
+            else:
+                response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+                save_journal_entry(f"User: {text}\nAI: {response}", S3_BUCKET, "journalgpt")
+        elif text.strip().lower().startswith("/new"):
             text = "(/new) Let's start a new conversation."
             response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         elif text.strip().lower().startswith("/exam"):
@@ -707,7 +818,7 @@ def lambda_handler(event, context):
             
             response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         else: 
-            text = f"Check in our previous conversation and return: '{text}'"
+            # text = f"Check in our current conversation and return: '{text}'"
             response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
 
         print(f"DEBUG: The response from generate_response is '{response}")
