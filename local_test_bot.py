@@ -34,8 +34,8 @@ List of bot commands:
 /journalgpt - Journal with AI assistant
 """
 
-DEFAULT_MODEL = "gpt-4o-mini"  # Use this as a fallback
-MAX_TOKENS = 128000  # For GPT-4o-mini, the maximum token limit is 128,000 tokens
+DEFAULT_MODEL = "gpt-4o"  # Use this as a fallback
+MAX_TOKENS = 128000  # For GPT-4o and mini, the maximum token limit is 128,000 tokens
 DEFAULT_ENCODING = "cl100k_base"  # This is used by gpt-3.5-turbo and gpt-4
 
 prompt_template = """The following is a friendly conversation between a human and an AI. 
