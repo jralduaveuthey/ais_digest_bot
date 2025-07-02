@@ -19,7 +19,7 @@ parent_dir = os.path.dirname(os.path.abspath(__file__))
 folder_name = os.path.basename(parent_dir)# Folder name and Lambda function name
 
 # Load all environment variables from .env into a dictionary
-env_vars = dotenv_values(f"{parent_dir}\\.env")
+env_vars = dotenv_values(os.path.join(parent_dir, ".env"))
 
 # Set up AWS ECR and Lambda clients
 session = boto3.Session()
@@ -72,8 +72,17 @@ with open(lambda_main_path, 'w') as file:
 
 # Build the Docker image with a tag
 tag = "latest"
-docker_build_cmd = f"docker build -t {folder_name}:{tag} . --platform=linux/amd64"
 print("Building docker image locally...")
+
+# Ensure buildx is available and set as default
+buildx_setup_cmd = "docker buildx create --use"
+try:
+    subprocess.run(buildx_setup_cmd, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+except Exception as e:
+    print("Buildx setup warning: ", str(e))
+
+# Build with buildx for proper platform support
+docker_build_cmd = f"docker buildx build --platform linux/amd64 --tag {folder_name}:{tag} --load ."
 try:
     result = subprocess.run(docker_build_cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
 except Exception as e:
@@ -149,12 +158,27 @@ except iam.exceptions.NoSuchEntityException:
 
 policies = [
     "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
-    "arn:aws:iam::aws:policy/AmazonPollyFullAccess",
+    "arn:aws:iam::aws:policy/AmazonPollyFullAccess", 
     "arn:aws:iam::aws:policy/AmazonTranscribeFullAccess",
     "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess"
 ]
 
+# Custom policy for content processor access (if it exists)
+custom_policy_arn = f"arn:aws:iam::{account_id}:policy/TelegramBotContentProcessorAccess"
+try:
+    iam.get_policy(PolicyArn=custom_policy_arn)
+    policies.append(custom_policy_arn)
+    print(f"Added custom policy: TelegramBotContentProcessorAccess")
+except iam.exceptions.NoSuchEntityException:
+    print(f"Custom policy TelegramBotContentProcessorAccess not found, skipping...")
+
 # Add inline policy for s3:HeadBucket and s3:ListBucket
+# Check if S3_BUCKET is defined in environment variables
+if 'S3_BUCKET' not in env_vars or not env_vars['S3_BUCKET']:
+    print("Error: S3_BUCKET is required in the .env file but was not found or is empty.")
+    print("Please add S3_BUCKET=your-bucket-name to your .env file and try again.")
+    exit(1)
+
 s3_access_policy = {
     "Version": "2012-10-17",
     "Statement": [
@@ -167,7 +191,7 @@ s3_access_policy = {
             ],
             "Resource": [
                 f"arn:aws:s3:::{env_vars['S3_BUCKET']}",
-                f"arn:aws:s3:::{env_vars['S3_BUCKET']}/*"  # Added this line
+                f"arn:aws:s3:::{env_vars['S3_BUCKET']}/*"
             ]
         },
         {
