@@ -3,13 +3,9 @@ import time
 import boto3
 import json
 import logging
-from langchain import PromptTemplate, ConversationChain
 import requests
 from datetime import datetime
 import hashlib
-from langchain.chat_models import ChatOpenAI
-from langchain.schema import BaseMemory
-from pydantic import BaseModel
 from typing import List, Dict, Any, Union, Tuple, Optional, Callable
 from contextlib import closing
 from bs4 import BeautifulSoup
@@ -20,7 +16,20 @@ from urllib3.util import Retry
 from bs4 import BeautifulSoup
 import logging
 import tiktoken
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+import openai
+import google.generativeai as genai
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('local_test_bot_no_langchain.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 #-------------------BOT SETTINGS-------------------#
 """
@@ -80,35 +89,79 @@ polly = boto3.client('polly')
 JOURNAL_FILE = "userlogs/journal.json"
 JOURNALGPT_FILE = "userlogs/journalgpt.json"
 
-class ConversationHistoryMemory(BaseMemory, BaseModel):
-    """Memory class for storing conversation history."""
-    # Define list to store conversation history.
-    conversation_history: Optional[List[Tuple[str, str]]] = []
-    # Define key to pass conversation history into prompt.
-    memory_key: str = "conversation_history"
+# Custom API Client Wrapper
+class LLMClient:
+    def __init__(self, api_key: str, model_name: str = DEFAULT_MODEL):
+        openai.api_key = api_key
+        self.model_name = model_name
+        
+    def generate(self, messages: List[Dict[str, str]], max_retries: int = 1) -> str:
+        """Generate a response from the OpenAI API."""
+        for attempt in range(max_retries):
+            try:
+                response = openai.ChatCompletion.create(
+                    model=self.model_name,
+                    messages=messages
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                logging.warning(f"API call failed, retrying... Error: {str(e)}")
+                time.sleep(1)
 
+# Custom Memory Management
+class ConversationMemory:
+    def __init__(self, conversation_history: Optional[List[Tuple[str, str]]] = None):
+        self.history = conversation_history or []
+    
     def clear(self):
-        self.conversation_history = []
+        """Clear the conversation history."""
+        self.history = []
+    
+    def add_exchange(self, user_msg: str, ai_msg: str):
+        """Add a user-AI exchange to the history."""
+        self.history.append((user_msg, ai_msg))
+    
+    def get_formatted_history(self) -> str:
+        """Get the formatted conversation history as a string."""
+        return "\n".join(f"Human: {human}\nAI: {ai}" for human, ai in self.history)
+    
+    def get_messages_for_api(self) -> List[Dict[str, str]]:
+        """Get the conversation history formatted for the OpenAI API."""
+        messages = []
+        for human, ai in self.history:
+            messages.append({"role": "user", "content": human})
+            messages.append({"role": "assistant", "content": ai})
+        return messages
 
-    @property
-    def memory_variables(self) -> List[str]:
-        """Define the variables we are providing to the prompt."""
-        return [self.memory_key]
-
-    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, str]:
-        """Load the memory variables, in this case the conversation history."""
-        # Get the previous conversations.
-        previous_conversations = self.conversation_history
-        # Return combined conversations to put into context.
-        return {self.memory_key: "\n".join(f"Human: {human}\nAI: {ai}" for human, ai in previous_conversations)}
-
-    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
-        """Save context from this conversation to buffer."""
-        # Get the input and output texts.
-        input_text = inputs[list(inputs.keys())[0]]
-        output_text = outputs[list(outputs.keys())[0]]
-        # Append the conversation to the history.
-        self.conversation_history.append((input_text, output_text))
+# Conversation Manager
+class ConversationManager:
+    def __init__(self, llm_client: LLMClient, memory: ConversationMemory, prompt_template: str):
+        self.llm = llm_client
+        self.memory = memory
+        self.prompt_template = prompt_template
+    
+    def predict(self, user_input: str) -> str:
+        """Generate a response for the user input."""
+        # Format the prompt with conversation history
+        formatted_prompt = self.prompt_template.format(
+            conversation_history=self.memory.get_formatted_history(),
+            input=user_input
+        )
+        
+        # Prepare messages for API
+        messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
+        messages.extend(self.memory.get_messages_for_api())
+        messages.append({"role": "user", "content": user_input})
+        
+        # Generate response
+        response = self.llm.generate(messages)
+        
+        # Save to memory
+        self.memory.add_exchange(user_input, response)
+        
+        return response
 
 def save_journal_entry(entry, S3_BUCKET, journal_type):
     filename = JOURNAL_FILE if journal_type == "journal" else JOURNALGPT_FILE
@@ -158,8 +211,6 @@ def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_
     Human: {input}
     AI Coach:"""
 
-    prompt = PromptTemplate(input_variables=["conversation_history", "input"], template=journalgpt_prompt_template)
-    
     conversation_history = load_conversation_history(username, S3_BUCKET)
     journalgpt_history = []
     for message, response in reversed(conversation_history):
@@ -167,12 +218,10 @@ def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_
             break
         journalgpt_history.insert(0, (message, response))
 
-    conversation = ConversationChain(
-        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name, max_retries=1), 
-        prompt=prompt, 
-        verbose=True, 
-        memory=ConversationHistoryMemory(conversation_history=journalgpt_history)
-    )
+    # Create LLM client, memory, and conversation manager
+    llm_client = LLMClient(api_key=OPENAI_API_KEY, model_name=model_name)
+    memory = ConversationMemory(conversation_history=journalgpt_history)
+    conversation = ConversationManager(llm_client, memory, journalgpt_prompt_template)
 
     return handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, model_name)
 
@@ -404,43 +453,38 @@ def get_encoding(model_name: str):
         print(f"Warning: Model '{model_name}' not found. Using cl100k_base encoding.")
         return tiktoken.get_encoding("cl100k_base")
 
-def num_tokens_from_messages(messages: List[Union[BaseMessage, Tuple[str, str]]], model_name: str) -> int:
+def num_tokens_from_messages(messages: List[Union[Dict[str, str], Tuple[str, str]]], model_name: str) -> int:
     encoding = get_encoding(model_name)
     num_tokens = 0
     for message in messages:
         num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
-        if isinstance(message, BaseMessage):
-            content = message.content
-            if isinstance(message, SystemMessage):
-                role = "system"
-            elif isinstance(message, HumanMessage):
-                role = "user"
-            elif isinstance(message, AIMessage):
-                role = "assistant"
-            else:
-                role = "user"  # default to user for unknown message types
+        if isinstance(message, dict):
+            # API format message
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            num_tokens += len(encoding.encode(content))
         elif isinstance(message, tuple):
+            # Conversation history format (user_message, ai_response)
             user_message, ai_response = message
+            num_tokens += len(encoding.encode(user_message))
+            num_tokens += len(encoding.encode(ai_response))
         else:
             raise ValueError(f"Unsupported message type: {type(message)}")
-        
-        num_tokens += len(encoding.encode(user_message))
-        num_tokens += len(encoding.encode(ai_response))
     num_tokens += 2  # every reply is primed with <im_start>assistant
     return num_tokens
 
 def trim_messages(
-    messages: List[BaseMessage],
+    messages: List[Dict[str, str]],
     max_tokens: int,
-    token_counter: Callable[[List[BaseMessage]], int],
+    token_counter: Callable[[List[Dict[str, str]]], int],
     strategy: str = "last",
     include_system: bool = True,
-) -> List[BaseMessage]:
+) -> List[Dict[str, str]]:
     if strategy not in ["last", "first"]:
         raise ValueError(f"Invalid strategy: {strategy}")
     
-    system_message = next((m for m in messages if isinstance(m, SystemMessage)), None)
-    non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
+    system_message = next((m for m in messages if m.get("role") == "system"), None)
+    non_system_messages = [m for m in messages if m.get("role") != "system"]
     
     if include_system and system_message:
         max_tokens -= token_counter([system_message])
@@ -473,11 +517,11 @@ def split_context(context: str, model_name: str, max_tokens: int = MAX_TOKENS) -
 
     return chunks
 
-def process_chunks(chunks: List[str], conversation: ConversationChain, TELEGRAM_BOT_TOKEN: str, chat_id: int) -> str:
+def process_chunks(chunks: List[str], conversation: ConversationManager, TELEGRAM_BOT_TOKEN: str, chat_id: int) -> str:
     """Processes each chunk and returns the final response."""
     responses = []
     for i, chunk in enumerate(chunks):
-        response = conversation.predict(input=f"Chunk {i+1}/{len(chunks)}: {chunk}")
+        response = conversation.predict(f"Chunk {i+1}/{len(chunks)}: {chunk}")
         responses.append(response)
         
         # Send a progress update to the user
@@ -487,27 +531,40 @@ def process_chunks(chunks: List[str], conversation: ConversationChain, TELEGRAM_
     final_response = "\n\n".join(responses)
     return final_response
 
-def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
+def handle_context_length(text: str, conversation: ConversationManager, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
     try:
-        return conversation.predict(input=text)
+        return conversation.predict(text)
     except Exception as e:
         if "maximum context length" in str(e).lower():
             warning_message = ("The context was too long. Trimming conversation history to fit within the token limit.")
             send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, warning_message)
             
-            all_messages = conversation.memory.conversation_history + [HumanMessage(content=text)]
+            # Convert conversation history to API format
+            messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
+            messages.extend(conversation.memory.get_messages_for_api())
+            messages.append({"role": "user", "content": text})
             
             trimmed_messages = trim_messages(
-                all_messages,
+                messages,
                 max_tokens=MAX_TOKENS - 1000,  # Leave some room for the response
                 token_counter=lambda msgs: num_tokens_from_messages(msgs, model_name),
                 strategy="last",
                 include_system=True
             )
             
-            conversation.memory.conversation_history = trimmed_messages[:-1]  # Exclude the last message (current input)
+            # Rebuild conversation history from trimmed messages
+            new_history = []
+            i = 1  # Skip system message
+            while i < len(trimmed_messages) - 1:  # Exclude the last message (current input)
+                if trimmed_messages[i]["role"] == "user" and i + 1 < len(trimmed_messages) and trimmed_messages[i + 1]["role"] == "assistant":
+                    new_history.append((trimmed_messages[i]["content"], trimmed_messages[i + 1]["content"]))
+                    i += 2
+                else:
+                    i += 1
             
-            return conversation.predict(input=text)
+            conversation.memory.history = new_history
+            
+            return conversation.predict(text)
         elif "You exceeded your current quota, please check your plan and billing details." in str(e):
             return "Sorry, I'm currently out of credits. Please try again later."
         else:
@@ -515,14 +572,11 @@ def handle_context_length(text: str, conversation, TELEGRAM_BOT_TOKEN: str, chat
 
 def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
     conversation_history = load_conversation_history(username, S3_BUCKET)
-    prompt = PromptTemplate(input_variables=["conversation_history", "input"], template=prompt_template)
     
-    conversation = ConversationChain(
-        llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name=model_name, max_retries=1), 
-        prompt=prompt, 
-        verbose=True, 
-        memory=ConversationHistoryMemory(conversation_history=conversation_history)
-    )
+    # Create LLM client, memory, and conversation manager
+    llm_client = LLMClient(api_key=OPENAI_API_KEY, model_name=model_name)
+    memory = ConversationMemory(conversation_history=conversation_history)
+    conversation = ConversationManager(llm_client, memory, prompt_template)
 
     return handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, model_name)
 
