@@ -24,12 +24,32 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('local_test_bot_no_langchain.log'),
-        logging.StreamHandler()
+        logging.StreamHandler()  # Only use console output, which goes to CloudWatch
     ]
 )
 
 logger = logging.getLogger(__name__)
+
+#-------------------MODEL PROVIDER SETTINGS-------------------#
+# Model provider configuration - change this to switch between providers
+MODEL_PROVIDER = "gemini"  # Options: "gemini", "openai"
+
+# Model configurations
+GEMINI_MODEL = "gemini-2.5-flash"
+OPENAI_MODEL = "gpt-4o-mini"
+
+# Set default model and max tokens based on provider
+if MODEL_PROVIDER == "gemini":
+    DEFAULT_MODEL = GEMINI_MODEL
+    MAX_TOKENS = 1048576  # Gemini 2.0 Flash has 1M token context window
+elif MODEL_PROVIDER == "openai":
+    DEFAULT_MODEL = OPENAI_MODEL
+    MAX_TOKENS = 128000  # GPT-4o-mini has 128K token context window
+else:
+    raise ValueError(f"Unsupported model provider: {MODEL_PROVIDER}")
+
+DEFAULT_ENCODING = "cl100k_base"  # This is used by gpt-3.5-turbo and gpt-4
+#--------------------------------------------------#
 
 #-------------------BOT SETTINGS-------------------#
 """
@@ -44,10 +64,6 @@ List of bot commands:
 /retrieve - Retrieve unprocessed content from content processor
 """
 
-DEFAULT_MODEL = "gpt-4o-mini"  # Use this as a fallback
-MAX_TOKENS = 128000  # For GPT-4o and mini, the maximum token limit is 128,000 tokens
-DEFAULT_ENCODING = "cl100k_base"  # This is used by gpt-3.5-turbo and gpt-4
-
 prompt_template = """The following is a friendly conversation between a human and an AI. 
     The AI is talkative and provides lots of specific details from its context. 
     If the AI does not know the answer to a question, it truthfully says it does not know.
@@ -59,6 +75,7 @@ prompt_template = """The following is a friendly conversation between a human an
 
 TELEGRAM_BOT_TOKEN_SSM_PATH ='/chatbot-ais-digest/TELEGRAM_BOT_TOKEN_AIS_Digest'
 OPENAI_API_KEY_SSM_PATH = '/chatbot-ais-digest/OPENAI_API_KEY'
+GOOGLE_API_KEY_SSM_PATH = '/chatbot-ais-digest/GOOGLE_API_KEY'
 S3_BUCKET_SSM_PATH = '/chatbot-ais-digest/S3_BUCKET'
 USERS_ALLOWED_SSM_PATH = '/chatbot-ais-digest/USERS_ALLOWED'
 RAPIDAPI_KEY_SSM_PATH = '/chatbot-ais-digest/RAPIDAPI_KEY'
@@ -91,19 +108,47 @@ JOURNALGPT_FILE = "userlogs/journalgpt.json"
 
 # Custom API Client Wrapper
 class LLMClient:
-    def __init__(self, api_key: str, model_name: str = DEFAULT_MODEL):
-        openai.api_key = api_key
+    def __init__(self, provider: str, api_key: str, model_name: str = DEFAULT_MODEL):
+        self.provider = provider.lower()
+        self.api_key = api_key
         self.model_name = model_name
         
+        if self.provider == "openai":
+            openai.api_key = api_key
+        elif self.provider == "gemini":
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel(model_name)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+        
     def generate(self, messages: List[Dict[str, str]], max_retries: int = 1) -> str:
-        """Generate a response from the OpenAI API."""
+        """Generate a response from the specified API."""
         for attempt in range(max_retries):
             try:
-                response = openai.ChatCompletion.create(
-                    model=self.model_name,
-                    messages=messages
-                )
-                return response.choices[0].message.content
+                if self.provider == "openai":
+                    response = openai.ChatCompletion.create(
+                        model=self.model_name,
+                        messages=messages
+                    )
+                    return response.choices[0].message.content
+                elif self.provider == "gemini":
+                    # Convert OpenAI-style messages to Gemini format
+                    prompt_parts = []
+                    for message in messages:
+                        role = message.get("role", "user")
+                        content = message.get("content", "")
+                        if role == "system":
+                            prompt_parts.append(f"System: {content}")
+                        elif role == "user":
+                            prompt_parts.append(f"Human: {content}")
+                        elif role == "assistant":
+                            prompt_parts.append(f"Assistant: {content}")
+                    
+                    full_prompt = "\n".join(prompt_parts)
+                    response = self.model.generate_content(full_prompt)
+                    return response.text
+                else:
+                    raise ValueError(f"Unsupported provider: {self.provider}")
             except Exception as e:
                 if attempt == max_retries - 1:
                     raise e
@@ -199,7 +244,7 @@ def is_in_journalgpt_mode(username, S3_BUCKET):
             return False
     return False
 
-def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name):
+def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name):
     journalgpt_prompt_template = """You are an AI coach assistant for journaling. Your role is to provide supportive, 
     insightful, and thought-provoking responses to the user's journal entries. Encourage self-reflection, personal growth, 
     and emotional awareness. Be empathetic and non-judgmental in your responses. If appropriate, you may ask follow-up 
@@ -218,8 +263,12 @@ def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_
             break
         journalgpt_history.insert(0, (message, response))
 
-    # Create LLM client, memory, and conversation manager
-    llm_client = LLMClient(api_key=OPENAI_API_KEY, model_name=model_name)
+    # Create LLM client, memory, and conversation manager based on MODEL_PROVIDER
+    if MODEL_PROVIDER == "gemini":
+        llm_client = LLMClient(provider="gemini", api_key=GOOGLE_API_KEY, model_name=model_name)
+    else:
+        llm_client = LLMClient(provider="openai", api_key=OPENAI_API_KEY, model_name=model_name)
+    
     memory = ConversationMemory(conversation_history=journalgpt_history)
     conversation = ConversationManager(llm_client, memory, journalgpt_prompt_template)
 
@@ -432,14 +481,18 @@ def send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
             Text=text,
             VoiceId=voice_name
         )
+        audio = None
         if "AudioStream" in response:
             with closing(response["AudioStream"]) as stream:
                 audio = stream.read()
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
-        data = {"chat_id": chat_id}
-        files = {"audio": io.BytesIO(audio)}
-        requests.post(url, data=data, files=files)
+        if audio:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendAudio"
+            data = {"chat_id": chat_id}
+            files = {"audio": io.BytesIO(audio)}
+            requests.post(url, data=data, files=files)
+        else:
+            logging.error("No audio stream found in Polly response")
     except Exception as e:
         logging.error(f"Error sending audio: {str(e)}")
         # Optionally, send a message to the user about the audio error
@@ -570,11 +623,15 @@ def handle_context_length(text: str, conversation: ConversationManager, TELEGRAM
         else:
             raise e
 
-def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
+def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, GOOGLE_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
     conversation_history = load_conversation_history(username, S3_BUCKET)
     
-    # Create LLM client, memory, and conversation manager
-    llm_client = LLMClient(api_key=OPENAI_API_KEY, model_name=model_name)
+    # Create LLM client, memory, and conversation manager based on MODEL_PROVIDER
+    if MODEL_PROVIDER == "gemini":
+        llm_client = LLMClient(provider="gemini", api_key=GOOGLE_API_KEY, model_name=model_name)
+    else:
+        llm_client = LLMClient(provider="openai", api_key=OPENAI_API_KEY, model_name=model_name)
+    
     memory = ConversationMemory(conversation_history=conversation_history)
     conversation = ConversationManager(llm_client, memory, prompt_template)
 
@@ -781,11 +838,12 @@ def handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id):
 
 def lambda_handler(event, context):
     try:
-        MODEL_NAME = 'gpt-4o-mini'
+        MODEL_NAME = DEFAULT_MODEL
 
         # Load tokens from Parameter Store
         TELEGRAM_BOT_TOKEN = get_parameter(ssm, TELEGRAM_BOT_TOKEN_SSM_PATH)
         OPENAI_API_KEY = get_parameter(ssm, OPENAI_API_KEY_SSM_PATH)
+        GOOGLE_API_KEY = get_parameter(ssm, GOOGLE_API_KEY_SSM_PATH)
         S3_BUCKET = get_parameter(ssm, S3_BUCKET_SSM_PATH)
         USERS_ALLOWED = get_parameter(ssm, USERS_ALLOWED_SSM_PATH).split(',')
         AUX_USERNAME = get_parameter(ssm, AUX_USERNAME_SSM_PATH)
@@ -891,11 +949,11 @@ def lambda_handler(event, context):
             if text.strip().lower() == "/new":
                 response = "JournalGPT mode deactivated. Your messages will now be processed normally."
             else:
-                response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+                response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
                 save_journal_entry(f"User: {text}\nAI: {response}", S3_BUCKET, "journalgpt")
         elif text.strip().lower().startswith("/new"):
             text = "(/new) Let's start a new conversation."
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         elif text.strip().lower().startswith("/exam"):
             text = """(/exam) 
             Ask the user for his understanding on the article/transcript/podcast that is being discussed 
@@ -913,7 +971,7 @@ def lambda_handler(event, context):
 
             Do not make any information up and respond only with information from the text. If it does not appear or you do not know then say so without making up information.
             """
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         elif text.strip().lower().startswith("/reflect"):
             text = """(/reflect) 
             You are an AI assistant designed to function as a reflective journal for the user. Your primary role is to generate daily or periodic prompts that encourage the user to reflect deeply on various aspects of their life. These prompts should be designed to help the user gain insight into their thoughts, feelings, behaviors, and overall well-being. You will not receive or expect any responses from the user, so your goal is to provide thought-provoking, introspective prompts that the user can contemplate and perhaps write about elsewhere.
@@ -948,7 +1006,7 @@ def lambda_handler(event, context):
 
             Remember, your role is to provide supportive, non-judgmental prompts that encourage the user to think deeply and compassionately about themselves. Your prompts should be varied and cater to different aspects of the user's life and inner experiences, helping them to continuously grow and improve without needing to respond directly to you.
             """
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         elif text.strip().lower().startswith("/stampy"):
             stampy_query = text[7:].strip()
             
@@ -1006,10 +1064,10 @@ def lambda_handler(event, context):
                 else:
                     text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
             
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         else: 
             # text = f"Check in our current conversation and return: '{text}'"
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
 
         print(f"DEBUG: The response from generate_response is '{response}")
 

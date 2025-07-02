@@ -17,6 +17,7 @@ openai = "==0.27.8"
 langchain = "==0.0.202"
 pydantic = "*"
 boto3 = "==1.18.12"
+google-generativeai = "==0.4.1"
 
 [dev-packages]
 
