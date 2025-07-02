@@ -9,7 +9,6 @@ pinecone-client = "==2.2.2"
 tqdm = "==4.65.0"
 tiktoken = "==0.4.0"
 python-dotenv = "*"
-boto3 = "*"
 elevenlabs = "*"
 bs4 = "*"
 youtube-transcript-api = "*"
@@ -17,6 +16,7 @@ langchain-core = "*"
 openai = "==0.27.8"
 langchain = "==0.0.202"
 pydantic = "*"
+boto3 = "==1.18.12"
 
 [dev-packages]
 

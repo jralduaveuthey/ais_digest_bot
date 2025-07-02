@@ -32,10 +32,11 @@ List of bot commands:
 /reflect - Solo Reflection
 /journal - Private journaling
 /journalgpt - Journal with AI assistant
+/retrieve - Retrieve unprocessed content from content processor
 """
 
 DEFAULT_MODEL = "gpt-4o-mini"  # Use this as a fallback
-MAX_TOKENS = 128000  # For GPT-4o-mini, the maximum token limit is 128,000 tokens
+MAX_TOKENS = 128000  # For GPT-4o and mini, the maximum token limit is 128,000 tokens
 DEFAULT_ENCODING = "cl100k_base"  # This is used by gpt-3.5-turbo and gpt-4
 
 prompt_template = """The following is a friendly conversation between a human and an AI. 
@@ -53,6 +54,10 @@ S3_BUCKET_SSM_PATH = '/chatbot-ais-digest/S3_BUCKET'
 USERS_ALLOWED_SSM_PATH = '/chatbot-ais-digest/USERS_ALLOWED'
 RAPIDAPI_KEY_SSM_PATH = '/chatbot-ais-digest/RAPIDAPI_KEY'
 AUX_USERNAME_SSM_PATH = '/aux-chatbot-ais-digest/AUX_USERNAME'
+
+# Content processor settings
+CONTENT_PROCESSOR_BUCKET = "content-processor-110199781938"
+CONTENT_PROCESSOR_STATE_FILE = "processing-state/state.json"
 
 voice_name="Joanna" #"Amy"#"Geraint"#"Joanna"  #to check other premade voices go to https://docs.aws.amazon.com/polly/latest/dg/voicelist.html
 MAX_RESPONSE_LENGTH_AUDIO = 3000  # Adjust as needed for Polly's limitations
@@ -597,6 +602,129 @@ def get_previous_url(username, S3_BUCKET):
             return message.strip().split('\n')[0]  # Return the message till the first newline
     return None
 
+def send_document_to_bot(TELEGRAM_BOT_TOKEN, chat_id, file_content, filename, caption=""):
+    """Send a document to the bot via Telegram's sendDocument API."""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        
+        files = {"document": (filename, io.BytesIO(file_content.encode('utf-8')), 'text/markdown')}
+        response = requests.post(url, data=data, files=files)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        logging.error(f"Error sending document: {str(e)}")
+        return False
+
+def load_content_processor_state():
+    """Load the state file from the content processor S3 bucket."""
+    try:
+        response = s3_client.get_object(Bucket=CONTENT_PROCESSOR_BUCKET, Key=CONTENT_PROCESSOR_STATE_FILE)
+        data = json.loads(response['Body'].read().decode('utf-8'))
+        return data
+    except s3_client.exceptions.NoSuchKey:
+        logging.warning(f"State file not found: {CONTENT_PROCESSOR_STATE_FILE}")
+        return {"youtube": {}, "readwise": {}}
+    except Exception as e:
+        logging.error(f"Error loading state file: {str(e)}")
+        return {"youtube": {}, "readwise": {}}
+
+def save_content_processor_state(state_data):
+    """Save the updated state file to the content processor S3 bucket."""
+    try:
+        s3_client.put_object(
+            Bucket=CONTENT_PROCESSOR_BUCKET, 
+            Key=CONTENT_PROCESSOR_STATE_FILE, 
+            Body=json.dumps(state_data, indent=2)
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Error saving state file: {str(e)}")
+        return False
+
+def get_content_file(file_path):
+    """Download content file from S3."""
+    try:
+        response = s3_client.get_object(Bucket=CONTENT_PROCESSOR_BUCKET, Key=file_path)
+        return response['Body'].read().decode('utf-8')
+    except Exception as e:
+        logging.error(f"Error downloading content file {file_path}: {str(e)}")
+        return None
+
+def handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id):
+    """Handle the /retrieve command to fetch and deliver unprocessed content."""
+    try:
+        # Load state file
+        state_data = load_content_processor_state()
+        
+        youtube_count = 0
+        readwise_count = 0
+        total_delivered = 0
+        
+        # Process YouTube content
+        if "youtube" in state_data:
+            for video_id, item_data in state_data["youtube"].items():
+                if item_data.get("processed", False) and not item_data.get("retrieved", False):
+                    # Download the content file
+                    file_content = get_content_file(item_data["file_path"])
+                    if file_content:
+                        # Send as document
+                        filename = f"youtube_{video_id}.md"
+                        caption = f"📄 YouTube: {item_data['title']}\n🔗 Original: {item_data['url']}"
+                        
+                        if send_document_to_bot(TELEGRAM_BOT_TOKEN, chat_id, file_content, filename, caption):
+                            # Mark as retrieved
+                            item_data["retrieved"] = True
+                            item_data["retrieved_date"] = datetime.utcnow().isoformat() + "Z"
+                            youtube_count += 1
+                            total_delivered += 1
+                            
+                            # Rate limiting: 1 second delay between messages
+                            time.sleep(1)
+                        else:
+                            logging.error(f"Failed to send YouTube video: {video_id}")
+        
+        # Process Readwise content
+        if "readwise" in state_data:
+            for article_id, item_data in state_data["readwise"].items():
+                if item_data.get("processed", False) and not item_data.get("retrieved", False):
+                    # Download the content file
+                    file_content = get_content_file(item_data["file_path"])
+                    if file_content:
+                        # Send as document
+                        filename = f"readwise_{article_id}.md"
+                        caption = f"📄 Readwise: {item_data['title']}\n🔗 Original: {item_data['url']}"
+                        
+                        if send_document_to_bot(TELEGRAM_BOT_TOKEN, chat_id, file_content, filename, caption):
+                            # Mark as retrieved
+                            item_data["retrieved"] = True
+                            item_data["retrieved_date"] = datetime.utcnow().isoformat() + "Z"
+                            readwise_count += 1
+                            total_delivered += 1
+                            
+                            # Rate limiting: 1 second delay between messages
+                            time.sleep(1)
+                        else:
+                            logging.error(f"Failed to send Readwise article: {article_id}")
+        
+        # Save updated state
+        if total_delivered > 0:
+            if save_content_processor_state(state_data):
+                summary = f"Retrieved {youtube_count} YouTube videos and {readwise_count} Readwise articles"
+            else:
+                summary = f"Delivered {youtube_count} YouTube videos and {readwise_count} Readwise articles, but failed to update state"
+        else:
+            summary = "No new content to retrieve"
+        
+        return summary
+        
+    except Exception as e:
+        error_msg = f"Error processing retrieve command: {str(e)}"
+        logging.error(error_msg)
+        return error_msg
+
 def lambda_handler(event, context):
     try:
         MODEL_NAME = 'gpt-4o-mini'
@@ -725,7 +853,7 @@ def lambda_handler(event, context):
             - Draw an image instead of using words (to find a visual way of expressing information)
             - Answer practice questions (created by the you the AI assistant)
             - Create your own challenging test questions
-            - Create a test question that puts what you’ve learned into a real-world context
+            - Create a test question that puts what you've learned into a real-world context
             - Take a difficult question you found in a practice test and modify it so that it involves different variables or adds an extra step
             - Form a study group (user + you the AI assistant) and quiz each other (for some subjects, you can even debate the topic, with one side trying to prove that the other person is missing a point or understanding it incorrectly)
 
@@ -764,7 +892,7 @@ def lambda_handler(event, context):
 
             Only when the user asks you to change the topic (saying "new" or "new topic") you will start again with a new topic. If not then with every prompt (e.g. the user say "more" or "in depth" or "next" you will help the user dive deeper in the topic that you have started without changing to a new one.
 
-            Remember, your role is to provide supportive, non-judgmental prompts that encourage the user to think deeply and compassionately about themselves. Your prompts should be varied and cater to different aspects of the user’s life and inner experiences, helping them to continuously grow and improve without needing to respond directly to you.
+            Remember, your role is to provide supportive, non-judgmental prompts that encourage the user to think deeply and compassionately about themselves. Your prompts should be varied and cater to different aspects of the user's life and inner experiences, helping them to continuously grow and improve without needing to respond directly to you.
             """
             response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
         elif text.strip().lower().startswith("/stampy"):
@@ -801,6 +929,14 @@ def lambda_handler(event, context):
             return {
                 'statusCode': 200,
                 'body': json.dumps('Transcript request processed.')
+            }
+        elif text.strip().lower().startswith("/retrieve"):
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "🔄 Retrieving content from processor...")
+            response = handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id)
+            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Retrieve request processed.')
             }
         elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
             parsed_url = urlparse(text)
