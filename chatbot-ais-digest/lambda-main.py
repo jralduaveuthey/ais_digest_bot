@@ -18,15 +18,34 @@ import logging
 import tiktoken
 import openai
 import google.generativeai as genai
+import os
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()  # Only use console output, which goes to CloudWatch
-    ]
-)
+# Environment detection function (defined early for logging setup)
+def is_running_in_lambda():
+    """Detect if code is running in AWS Lambda environment."""
+    return bool(os.environ.get('AWS_LAMBDA_FUNCTION_NAME'))
+
+# Configure logging based on environment
+if is_running_in_lambda():
+    # Lambda environment - log to CloudWatch
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()  # Only use console output, which goes to CloudWatch
+        ]
+    )
+else:
+    # Local environment - log to both console and file
+    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lambda-main.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),  # Console output
+            logging.FileHandler(log_file)  # File output
+        ]
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +92,13 @@ prompt_template = """The following is a friendly conversation between a human an
     Human: {input}
     AI:"""
 
-TELEGRAM_BOT_TOKEN_SSM_PATH ='/chatbot-ais-digest/TELEGRAM_BOT_TOKEN_AIS_Digest'
+# Dynamically set the token path based on environment
+if is_running_in_lambda():
+    TELEGRAM_BOT_TOKEN_SSM_PATH = '/chatbot-ais-digest/TELEGRAM_BOT_TOKEN_AIS_Digest'
+    logger.info("Running in AWS Lambda environment - using production token")
+else:
+    TELEGRAM_BOT_TOKEN_SSM_PATH = '/chatbot-ais-digest/TELEGRAM_BOT_TOKEN_AIS_Digest_local'
+    logger.info("Running locally - using local token")
 OPENAI_API_KEY_SSM_PATH = '/chatbot-ais-digest/OPENAI_API_KEY'
 GOOGLE_API_KEY_SSM_PATH = '/chatbot-ais-digest/GOOGLE_API_KEY'
 S3_BUCKET_SSM_PATH = '/chatbot-ais-digest/S3_BUCKET'
@@ -99,9 +124,17 @@ BOT_AUDIO_RESPONSE = False
 #--------------------------------------------------#
 
 region = 'eu-central-1'
-ssm = boto3.client('ssm', region_name=region)  # Adjust the region as needed.
-s3_client = boto3.client('s3', region_name=region)
-polly = boto3.client('polly')
+
+# Initialize AWS clients conditionally based on environment
+if is_running_in_lambda():
+    ssm = boto3.client('ssm', region_name=region)
+    s3_client = boto3.client('s3', region_name=region)
+    polly = boto3.client('polly')
+else:
+    # For local development, these will be initialized in main() after loading .env
+    ssm = None
+    s3_client = None
+    polly = None
 
 JOURNAL_FILE = "userlogs/journal.json"
 JOURNALGPT_FILE = "userlogs/journalgpt.json"
@@ -464,10 +497,26 @@ def generate_uuid(timestamp, text):
     return hash_object.hexdigest()
 
 def get_parameter(ssm, name):
-    """Retrieve a parameter by name from AWS Systems Manager Parameter Store."""
-    print(f"Getting parameter '{name}' from the AWS Parameter Store.")
-    response = ssm.get_parameter(Name=name, WithDecryption=True)
-    return response['Parameter']['Value']
+    """Retrieve a parameter by name from AWS Systems Manager Parameter Store or from environment."""
+    if is_running_in_lambda():
+        print(f"Getting parameter '{name}' from the AWS Parameter Store.")
+        response = ssm.get_parameter(Name=name, WithDecryption=True)
+        return response['Parameter']['Value']
+    else:
+        # For local environment, get from environment variables
+        env_key = name.split('/')[-1]  # Extract the last part of the path
+        value = os.environ.get(env_key)
+        if value:
+            logger.info(f"Got parameter '{env_key}' from environment variable")
+            return value
+        else:
+            # If not in environment, try AWS Parameter Store anyway
+            if ssm:
+                logger.info(f"Getting parameter '{name}' from AWS Parameter Store (local fallback)")
+                response = ssm.get_parameter(Name=name, WithDecryption=True)
+                return response['Parameter']['Value']
+            else:
+                raise ValueError(f"Parameter '{env_key}' not found in environment variables")
 
 def send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -1124,5 +1173,55 @@ def lambda_handler(event, context):
             'statusCode': 500,
             'body': json.dumps(error_message)
         }
+
+
+def main():
+    # Load environment variables from .env file if it exists
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+        logger.info(f"Loaded environment variables from {env_path}")
+    else:
+        logger.info(".env file not found, using system environment variables")
+    
+    # Initialize AWS clients for local environment
+    global ssm, s3_client, polly
+    
+    RESPOND_LAST_N_MESSAGES = 1
+    context =''
+    ssm = boto3.client('ssm', region_name=region)  # Adjust the region as needed.
+    s3_client = boto3.client('s3', region_name=region)
+    polly = boto3.client('polly')
+    TELEGRAM_BOT_TOKEN = get_parameter(ssm, TELEGRAM_BOT_TOKEN_SSM_PATH)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    response = requests.get(url)
+    updates = response.json()
+    if updates["result"] == []:
+        print("No updates")
+        return
+
+    events = [] #NOTE: here I am creating a list of events but the lambda will only get one event with the info of one message. Each message triggers a webhook that triggers a lambda
+    for result in updates["result"]:
+        event = {
+            "resource": "/{proxy+}",
+            "path": "/your_bot_path",
+            "httpMethod": "POST",
+            "headers": {
+                "Content-Type": "application/json"
+            },
+            "body": json.dumps(result),
+            "isBase64Encoded": 'false'
+        }
+        events.append(event)
+
+    for event in events[-RESPOND_LAST_N_MESSAGES:]:
+        lambda_handler(event, context)
+
+
+if __name__ == "__main__":
+    # Only run main() when executed directly (not imported by Lambda)
+    if not is_running_in_lambda():
+        main()
 
 

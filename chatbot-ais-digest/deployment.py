@@ -45,30 +45,16 @@ for key, value in filtered_keys.items():
 # Change to the folder where this script is located
 os.chdir(parent_dir)
 
-# Go one directory up for the local_test_bot.py file
-parent_directory = os.path.dirname(parent_dir)
-local_test_bot_path = os.path.join(parent_directory, 'local_test_bot.py')
-
-# Path for lambda-main.py remains same
+# Path for lambda-main.py
 lambda_main_path = os.path.join(parent_dir, 'lambda-main.py')
 
-# Open the local_test_bot.py in read mode
-with open(local_test_bot_path, 'r') as local_test_bot_file:
-    # Open the lambda-main.py in write mode
-    with open(lambda_main_path, 'w') as lambda_main_file:
-        for line in local_test_bot_file:
-            # If the line starts with ##################, stop copying
-            if line.startswith('##################'):
-                break
-            # Otherwise, write the line to lambda-main.py
-            lambda_main_file.write(line)
+# Verify lambda-main.py exists
+if not os.path.exists(lambda_main_path):
+    print(f"Error: lambda-main.py not found at {lambda_main_path}")
+    exit(1)
 
-# Just to be sure, replace '_local' with ''
-with open(lambda_main_path, 'r') as file:
-    file_data = file.read()
-file_data = file_data.replace('_local', '')
-with open(lambda_main_path, 'w') as file:
-    file.write(file_data)
+print(f"Using lambda-main.py from: {lambda_main_path}")
+# Note: lambda-main.py now contains environment detection and works in both local and AWS environments
 
 # Build the Docker image with a tag
 tag = "latest"

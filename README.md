@@ -1,82 +1,123 @@
-AI Safety Digest Telegram bot
+# AIS Digest Telegram Bot
 
-# Features
-- LLM provider agnostic: It is built with langchain to it is pretty straightforward to change the codes to work with other LLMs (e.g. Claude, ...)
-- Easy to setup. Instructions bellow. For the deployment of your bot's function you just need to run one python file.
+A unified Telegram bot that works seamlessly in both local development and AWS Lambda environments.
 
-# Setup instructions
-## General Notes
-- Everything here is for a bot named AIS_Digest that runs on AWS and for a local version of the same bot called in telegram AIS_Digest_local. Change the names accordingly for your bot. This involves changing the names of the "chatbot-ais-digest" folder (because the naming will used in some scripts to name some variables automatically), and in the local_test_bot.py
-- After cloning the repo you should frist run ``pipenv install`` to setup a new pipenv venv with the proper libraries  
-- If you face problems raise reproducing it raise an issue in Github
-- Set up the .env file: Create a file named `.env` containing the same info as `.env.example` . You should fill it in as you progress through this instructions
+## Overview
 
-## Telegram
-- Set up 2 bots as done in this [tutorial>Setting up the Telegram bot
-](https://dev.to/epam_india_python/telegram-ai-bot-creation-using-chatgpt-and-aws-lambda-python-5f6g)
-- If you want to add a menu to your chatbot you can do it in the conversation with the BotFather. Select your chatbot under /mybots then "Configure Menu button" then select again your chatbot and "Edit commands", e.g. "new - Start new conversation"
+This bot uses a single `lambda-main.py` file that automatically detects its runtime environment and configures itself accordingly:
+- **Local Development**: Uses local environment variables and a test bot token
+- **AWS Lambda**: Uses AWS Systems Manager Parameter Store and production bot token
 
-## AWS
-To run the later deployment.py script successfully, you need to set up a AWS account and configure the AWS CLI:
+## Setup Instructions
 
-1. Create an AWS account:
-   - Go to https://aws.amazon.com/
-   - Click on "Create an AWS Account"
-   - Follow the prompts to create your account
+### 1. Prerequisites
+- Python 3.9+
+- AWS CLI configured (for AWS deployment)
+- Docker Desktop (for AWS deployment)
+- Telegram bot tokens (one for local testing, one for production)
 
-2. Set up an IAM user:
-   - Log in to the AWS Management Console
-   - Search for "IAM" and go to the IAM dashboard
-   - Click on "Users" in the left sidebar, then "Add user"
-   - Choose a username and select "Programmatic access"
-   - For permissions, choose "Attach existing policies directly" and select "AdministratorAccess" (Note: In a production environment, you'd want to limit permissions, but for this setup, we'll use full access)
-   - Complete the user creation process
-   - At the final step, you'll see the Access Key ID and Secret Access Key. Keep this page open or download the CSV file
+### 2. Initial Setup
+```bash
+# Clone the repository
+git clone <repository-url>
+cd ais_digest_bot
 
-3. Install the AWS CLI:
-   - Go to https://aws.amazon.com/cli/
-   - Download and install the AWS CLI for your operating system
+# Install dependencies
+pipenv install
+```
 
-4. Configure the AWS CLI:
-   - Open a terminal or command prompt
-   - Run the command: `aws configure`
-   - You'll be prompted to enter the following:
-     - AWS Access Key ID: Enter the Access Key ID from step 2
-     - AWS Secret Access Key: Enter the Secret Access Key from step 2
-     - Default region name: Enter your preferred AWS region (e.g., us-east-1, eu-west-1)
-     - Default output format: Enter 'json'
+### 3. Configure Environment Variables
 
-5. Create an S3 bucket:
-   - Log in to the AWS Management Console
-   - Go to the S3 service
-   - Click "Create bucket"
-   - Choose a unique name for your bucket (add this to the S3_BUCKET value in your .env file, e.g. "ais-digest")
-   - Configure the bucket settings as needed
-   - Create the bucket
+#### For Local Development
+1. Copy the example environment file:
+   ```bash
+   cp chatbot-ais-digest/.env.example chatbot-ais-digest/.env
+   ```
 
+2. Edit `.env` and fill in your values:
+   ```env
+   # Local bot token
+   TELEGRAM_BOT_TOKEN_AIS_Digest_local=your_local_bot_token
+   
+   # API Keys
+   OPENAI_API_KEY=your_openai_key
+   GOOGLE_API_KEY=your_google_key
+   
+   # S3 Bucket
+   S3_BUCKET=your_bucket_name
+   
+   # Allowed users (comma-separated Telegram usernames or IDs)
+   USERS_ALLOWED=username1,username2,12345678
+   ```
 
-## Deployment
-- There are 2 chatbots so that you can use the local_test_bot.py for debugging in the "_local" chatbot. When you run the deployment.py file the lambda-main.py should be automatically updated and deployed to AWS so that it works as your local bot.  
-- Start Docker Desktop. Necessary for the deployment.py to build the container image with the codes of your chatbot.
-- The local_test_bot.py already has a working functionality so you can just run deployment.py.
-- deployment.py will create or update an ECR repository, build and push a Docker image, and create or update a Lambda function using that image.
+#### For AWS Deployment
+The `deployment.py` script automatically uploads environment variables to AWS Parameter Store.
 
-## A bit more AWS (API Gateway)
-Follow instructions in this [tutorial>HTTP API in the API Gateway service
-](https://dev.to/epam_india_python/telegram-ai-bot-creation-using-chatgpt-and-aws-lambda-python-5f6g).  
-Note: so that the API Gateway can trigger the lambda you have to select the version 1.0 for the lambda when creating the HTTP API.
-![alt text](imgs/image.png)
+### 4. Running Locally
+```bash
+cd chatbot-ais-digest
+python lambda-main.py
+```
 
+The bot will:
+- Detect it's running locally
+- Load environment variables from `.env`
+- Use the local bot token
+- Log to both console and `lambda-main.log`
 
-Also the route has to be ANY and not POST cause otherwise does not work.
-![alt text](imgs/image-1.png)
+### 5. Deploying to AWS
 
-When setting up the webhook you have to use the url that appears in the trigger from the lambda function and not the Invoke URL from the API Gateway.
+1. Ensure Docker Desktop is running
+2. Run the deployment script:
+   ```bash
+   cd chatbot-ais-digest
+   python deployment.py
+   ```
 
-In my case it looks something like this: `https://api.telegram.org/bot123456:YYYY/setWebhook?url=https://XXXX.execute-api.eu-central-1.amazonaws.com/chatbot-ais-digest`
+The deployment script will:
+- Upload environment variables to AWS Parameter Store
+- Build a Docker image
+- Push to Amazon ECR
+- Create/update the Lambda function
 
-![alt text](imgs/image-2.png)
+### 6. Setting up API Gateway
+Follow the standard AWS API Gateway setup for Telegram webhooks:
+1. Create an HTTP API in API Gateway
+2. Set the route to `ANY /{proxy+}`
+3. Configure Lambda integration with payload format version 1.0
+4. Use the Lambda function URL for the Telegram webhook
 
+## Environment Detection
 
-# Test and deploy
-You can test by writing in your telegram to the local version on your bot and then running/debugging locally local_test_bot.py. Once it is working locally just run deployment.py to modify the bot in the cloud.
+The bot automatically detects its environment:
+
+```python
+def is_running_in_lambda():
+    return bool(os.environ.get('AWS_LAMBDA_FUNCTION_NAME'))
+```
+
+Based on this detection:
+- **Token Selection**: Uses `_local` suffix for local tokens
+- **Parameter Retrieval**: Local uses `.env`, AWS uses Parameter Store
+- **Logging**: Local logs to file, AWS logs to CloudWatch
+
+## Bot Commands
+- `/new` - Start a new conversation
+- `/stampy` - Ask Stampy AI
+- `/transcript` - Get transcript of linked content
+- `/exam` - Test your understanding
+- `/reflect` - Solo reflection mode
+- `/journal` - Private journaling
+- `/journalgpt` - Journal with AI assistance
+- `/retrieve` - Retrieve unprocessed content
+
+## Troubleshooting
+
+### User Not Authorized
+Add your Telegram username or ID to `USERS_ALLOWED` in the `.env` file
+
+### Local Token Issues
+Ensure `TELEGRAM_BOT_TOKEN_AIS_Digest_local` is set in `.env`
+
+### AWS Parameter Store Fallback
+Some parameters (like `AUX_USERNAME`) may still be fetched from AWS even when running locally if not defined in `.env`
