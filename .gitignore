@@ -4,3 +4,4 @@ chatbot-ais-digest/.env
 logs/
 __pycache__/
 TODO
+chatbot-ais-digest/lambda-main.log

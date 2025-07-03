@@ -519,9 +519,54 @@ def get_parameter(ssm, name):
                 raise ValueError(f"Parameter '{env_key}' not found in environment variables")
 
 def send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
+    """Send a message to the bot, splitting if necessary to handle Telegram's 4096 char limit."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": chat_id, "text": text}
-    requests.post(url, data=data)
+    
+    # Split long messages
+    max_length = 4096
+    if len(text) <= max_length:
+        data = {"chat_id": chat_id, "text": text}
+        try:
+            response = requests.post(url, data=data)
+            response.raise_for_status()
+            result = response.json()
+            if not result.get('ok'):
+                logger.error(f"Telegram API error: {result.get('description', 'Unknown error')}")
+        except Exception as e:
+            logger.error(f"Error sending message to Telegram: {str(e)}")
+    else:
+        # Split the message into chunks
+        chunks = []
+        while text:
+            # Find a good breaking point (newline or space) before max_length
+            if len(text) <= max_length:
+                chunks.append(text)
+                break
+            
+            # Look for newline first, then space
+            break_point = text.rfind('\n', 0, max_length)
+            if break_point == -1:
+                break_point = text.rfind(' ', 0, max_length)
+            if break_point == -1:
+                break_point = max_length
+            
+            chunks.append(text[:break_point])
+            text = text[break_point:].lstrip()
+        
+        # Send each chunk
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                time.sleep(0.5)  # Rate limiting between messages
+            
+            data = {"chat_id": chat_id, "text": chunk}
+            try:
+                response = requests.post(url, data=data)
+                response.raise_for_status()
+                result = response.json()
+                if not result.get('ok'):
+                    logger.error(f"Telegram API error on chunk {i+1}/{len(chunks)}: {result.get('description', 'Unknown error')}")
+            except Exception as e:
+                logger.error(f"Error sending message chunk {i+1}/{len(chunks)} to Telegram: {str(e)}")
 
 def send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
     try:
