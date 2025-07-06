@@ -21,13 +21,30 @@ folder_name = os.path.basename(parent_dir)# Folder name and Lambda function name
 # Load all environment variables from .env into a dictionary
 env_vars = dotenv_values(os.path.join(parent_dir, ".env"))
 
-# Set up AWS ECR and Lambda clients
-session = boto3.Session()
-region = session.region_name
-ecr_client = boto3.client('ecr')
-lambda_client = boto3.client('lambda')
+# Extract AWS credentials from env_vars
+aws_access_key_id = env_vars.get('AWS_ACCESS_KEY_ID')
+aws_secret_access_key = env_vars.get('AWS_SECRET_ACCESS_KEY')
+aws_region = env_vars.get('AWS_DEFAULT_REGION', 'eu-central-1')
 
-ssm_client = boto3.client('ssm', region_name=region)
+# Set up AWS session with credentials from .env
+if aws_access_key_id and aws_secret_access_key:
+    session = boto3.Session(
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=aws_region
+    )
+    print(f"Using AWS credentials from .env file for region {aws_region}")
+else:
+    # Fall back to default credential chain if not in .env
+    session = boto3.Session()
+    print("Using default AWS credential chain")
+
+region = session.region_name or aws_region
+
+# Set up AWS clients using the configured session
+ecr_client = session.client('ecr')
+lambda_client = session.client('lambda')
+ssm_client = session.client('ssm')
 
 # filtered_keys = {k:v for k, v in env_vars.items() if 'key' not in k.lower()} # Filter keys to exclude those containing 'key' in their name 
 filtered_keys = env_vars
@@ -92,7 +109,15 @@ registry_uri = response['repositories'][0]['repositoryUri']
 
 login_cmd = ecr_client.get_authorization_token(registryIds=[registry_id])['authorizationData'][0]['proxyEndpoint']
 try:
-    subprocess.run(f"aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {login_cmd}", shell=True, check=True)
+    # Set AWS environment variables for the subprocess if credentials are from .env
+    env = os.environ.copy()
+    if aws_access_key_id and aws_secret_access_key:
+        env['AWS_ACCESS_KEY_ID'] = aws_access_key_id
+        env['AWS_SECRET_ACCESS_KEY'] = aws_secret_access_key
+        env['AWS_DEFAULT_REGION'] = region
+    
+    subprocess.run(f"aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {login_cmd}", 
+                   shell=True, check=True, env=env)
 except subprocess.CalledProcessError as e:
     print("Subprocess returned an error:", e)
 
@@ -112,9 +137,9 @@ try:
 except lambda_client.exceptions.ResourceNotFoundException:
     update = False
 
-sts_client = boto3.client('sts')
+sts_client = session.client('sts')
 account_id = sts_client.get_caller_identity()["Account"]
-iam = boto3.client('iam')
+iam = session.client('iam')
 
 role_name = f'{lambda_function_name}_execution_role'
 assume_role_policy_document = {

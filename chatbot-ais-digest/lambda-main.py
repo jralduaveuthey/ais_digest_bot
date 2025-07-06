@@ -81,6 +81,7 @@ List of bot commands:
 /journal - Private journaling
 /journalgpt - Journal with AI assistant
 /retrieve - Retrieve unprocessed content from content processor
+/email - Send conversation summary via email (add text after command for additional info)
 """
 
 prompt_template = """The following is a friendly conversation between a human and an AI. 
@@ -105,6 +106,8 @@ S3_BUCKET_SSM_PATH = '/chatbot-ais-digest/S3_BUCKET'
 USERS_ALLOWED_SSM_PATH = '/chatbot-ais-digest/USERS_ALLOWED'
 RAPIDAPI_KEY_SSM_PATH = '/chatbot-ais-digest/RAPIDAPI_KEY'
 AUX_USERNAME_SSM_PATH = '/aux-chatbot-ais-digest/AUX_USERNAME'
+MAILGUN_API_KEY_SSM_PATH = '/chatbot-ais-digest/MAILGUN_API_KEY'
+MAILGUN_DOMAIN_SSM_PATH = '/chatbot-ais-digest/MAILGUN_DOMAIN'
 
 # Content processor settings
 CONTENT_PROCESSOR_BUCKET = "content-processor-110199781938"
@@ -568,6 +571,74 @@ def send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
             except Exception as e:
                 logger.error(f"Error sending message chunk {i+1}/{len(chunks)} to Telegram: {str(e)}")
 
+def send_email_via_mailgun(recipient_email, subject, conversation_data, additional_info="", mailgun_api_key=None, mailgun_domain=None):
+    """Send email using Mailgun API with conversation summary."""
+    try:
+        # Format the conversation history
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <h2>Telegram Bot Conversation</h2>
+            <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p><strong>Username:</strong> {conversation_data.get('username', 'Unknown')}</p>
+            
+            {f'<p><strong>Additional Info:</strong> {additional_info}</p>' if additional_info else ''}
+            
+            <h3>Conversation History:</h3>
+            <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px;">
+        """
+        
+        # Add conversation history
+        conversation_history = conversation_data.get('history', [])
+        if conversation_history:
+            for msg, response in conversation_history:
+                # Escape HTML to prevent injection
+                msg = msg.replace('<', '&lt;').replace('>', '&gt;')
+                response = response.replace('<', '&lt;').replace('>', '&gt;')
+                html_content += f"""
+                <div style="margin-bottom: 15px;">
+                    <p style="color: #0066cc;"><strong>User:</strong> {msg}</p>
+                    <p style="color: #333;"><strong>Bot:</strong> {response}</p>
+                </div>
+                <hr style="border: none; border-top: 1px solid #ddd;">
+                """
+        else:
+            html_content += "<p>No conversation history available.</p>"
+        
+        html_content += """
+            </div>
+            <p style="margin-top: 20px; font-size: 12px; color: #666;">
+                This email was sent from the AIS Digest Telegram Bot
+            </p>
+        </body>
+        </html>
+        """
+        
+        # Send email via Mailgun
+        response = requests.post(
+            f"https://api.mailgun.net/v3/{mailgun_domain}/messages",
+            auth=("api", mailgun_api_key),
+            data={
+                "from": f"AIS Digest Bot <mailgun@{mailgun_domain}>",
+                "to": [recipient_email],
+                "subject": subject,
+                "html": html_content
+            }
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"Email sent successfully via Mailgun: {result.get('id', 'No ID')}")
+            return True, result.get('id', 'Success')
+        else:
+            error_msg = f"Mailgun API error: {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return False, error_msg
+        
+    except Exception as e:
+        logger.error(f"Failed to send email via Mailgun: {str(e)}")
+        return False, str(e)
+
 def send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
     try:
         response = polly.synthesize_speech(
@@ -942,6 +1013,8 @@ def lambda_handler(event, context):
         USERS_ALLOWED = get_parameter(ssm, USERS_ALLOWED_SSM_PATH).split(',')
         AUX_USERNAME = get_parameter(ssm, AUX_USERNAME_SSM_PATH)
         RAPIDAPI_KEY = get_parameter(ssm, RAPIDAPI_KEY_SSM_PATH)
+        MAILGUN_API_KEY = get_parameter(ssm, MAILGUN_API_KEY_SSM_PATH)
+        MAILGUN_DOMAIN = get_parameter(ssm, MAILGUN_DOMAIN_SSM_PATH)
 
         print(f"DEBUG: The event received is: {event}")
         message = json.loads(event['body'])['message']
@@ -1136,6 +1209,37 @@ def lambda_handler(event, context):
                 'statusCode': 200,
                 'body': json.dumps('Transcript request processed.')
             }
+        elif text.strip().lower().startswith("/email"):
+            # Extract any additional info after /email command
+            email_parts = text.strip().split(maxsplit=1)
+            additional_info = email_parts[1] if len(email_parts) > 1 else ""
+            
+            # Load conversation history
+            conversation_history = load_conversation_history(current_user, S3_BUCKET)
+            
+            # Prepare conversation data
+            conversation_data = {
+                'username': current_user,
+                'history': conversation_history
+            }
+            
+            # Prepare email subject with unique timestamp
+            subject = f"Telegram Bot Conversation - {current_user} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            # Send email
+            success, result = send_email_via_mailgun(
+                recipient_email="jaime.raldua.veuthey@gmail.com",
+                subject=subject,
+                conversation_data=conversation_data,
+                additional_info=additional_info,
+                mailgun_api_key=MAILGUN_API_KEY,
+                mailgun_domain=MAILGUN_DOMAIN
+            )
+            
+            if success:
+                response = f"📧 Email sent successfully! Message ID: {result}"
+            else:
+                response = f"❌ Failed to send email: {result}"
         elif text.strip().lower().startswith("/retrieve"):
             send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "🔄 Retrieving content from processor...")
             response = handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id)
