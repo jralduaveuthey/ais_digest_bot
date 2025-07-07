@@ -50,24 +50,40 @@ else:
 logger = logging.getLogger(__name__)
 
 #-------------------MODEL PROVIDER SETTINGS-------------------#
-# Model provider configuration - change this to switch between providers
-MODEL_PROVIDER = "gemini"  # Options: "gemini", "openai"
+# Model provider configuration - these will be loaded from Parameter Store
+# Default fallback values (will be overridden by Parameter Store values)
+DEFAULT_MODEL_PROVIDER = "gemini"  # Options: "gemini", "openai"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 
-# Model configurations
-GEMINI_MODEL = "gemini-2.5-flash"
-OPENAI_MODEL = "gpt-4o-mini"
-
-# Set default model and max tokens based on provider
-if MODEL_PROVIDER == "gemini":
-    DEFAULT_MODEL = GEMINI_MODEL
-    MAX_TOKENS = 1048576  # Gemini 2.0 Flash has 1M token context window
-elif MODEL_PROVIDER == "openai":
-    DEFAULT_MODEL = OPENAI_MODEL
-    MAX_TOKENS = 128000  # GPT-4o-mini has 128K token context window
-else:
-    raise ValueError(f"Unsupported model provider: {MODEL_PROVIDER}")
+# These will be set after loading from Parameter Store
+MODEL_PROVIDER = None
+GEMINI_MODEL = None
+OPENAI_MODEL = None
+DEFAULT_MODEL = None
+MAX_TOKENS = None
 
 DEFAULT_ENCODING = "cl100k_base"  # This is used by gpt-3.5-turbo and gpt-4
+
+def initialize_model_config(model_provider, gemini_model, openai_model):
+    """Initialize model configuration based on Parameter Store values."""
+    global MODEL_PROVIDER, GEMINI_MODEL, OPENAI_MODEL, DEFAULT_MODEL, MAX_TOKENS
+    
+    MODEL_PROVIDER = model_provider
+    GEMINI_MODEL = gemini_model
+    OPENAI_MODEL = openai_model
+    
+    # Set default model and max tokens based on provider
+    if MODEL_PROVIDER == "gemini":
+        DEFAULT_MODEL = GEMINI_MODEL
+        MAX_TOKENS = 1048576  # Gemini 2.0 Flash has 1M token context window
+    elif MODEL_PROVIDER == "openai":
+        DEFAULT_MODEL = OPENAI_MODEL
+        MAX_TOKENS = 128000  # GPT-4o-mini has 128K token context window
+    else:
+        raise ValueError(f"Unsupported model provider: {MODEL_PROVIDER}")
+    
+    logger.info(f"Model configuration initialized: Provider={MODEL_PROVIDER}, Model={DEFAULT_MODEL}, Max Tokens={MAX_TOKENS}")
 #--------------------------------------------------#
 
 #-------------------BOT SETTINGS-------------------#
@@ -108,6 +124,9 @@ RAPIDAPI_KEY_SSM_PATH = '/chatbot-ais-digest/RAPIDAPI_KEY'
 AUX_USERNAME_SSM_PATH = '/aux-chatbot-ais-digest/AUX_USERNAME'
 MAILGUN_API_KEY_SSM_PATH = '/chatbot-ais-digest/MAILGUN_API_KEY'
 MAILGUN_DOMAIN_SSM_PATH = '/chatbot-ais-digest/MAILGUN_DOMAIN'
+MODEL_PROVIDER_SSM_PATH = '/chatbot-ais-digest/MODEL_PROVIDER'
+GEMINI_MODEL_SSM_PATH = '/chatbot-ais-digest/GEMINI_MODEL'
+OPENAI_MODEL_SSM_PATH = '/chatbot-ais-digest/OPENAI_MODEL'
 
 # Content processor settings
 CONTENT_PROCESSOR_BUCKET = "content-processor-110199781938"
@@ -1003,6 +1022,19 @@ def handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id):
 
 def lambda_handler(event, context):
     try:
+        # Load model configuration from Parameter Store first
+        try:
+            model_provider = get_parameter(ssm, MODEL_PROVIDER_SSM_PATH)
+            gemini_model = get_parameter(ssm, GEMINI_MODEL_SSM_PATH)
+            openai_model = get_parameter(ssm, OPENAI_MODEL_SSM_PATH)
+        except Exception as e:
+            logger.warning(f"Failed to load model config from Parameter Store: {e}. Using defaults.")
+            model_provider = DEFAULT_MODEL_PROVIDER
+            gemini_model = DEFAULT_GEMINI_MODEL
+            openai_model = DEFAULT_OPENAI_MODEL
+        
+        # Initialize model configuration
+        initialize_model_config(model_provider, gemini_model, openai_model)
         MODEL_NAME = DEFAULT_MODEL
 
         # Load tokens from Parameter Store
@@ -1333,6 +1365,17 @@ def main():
         logger.info(f"Loaded environment variables from {env_path}")
     else:
         logger.info(".env file not found, using system environment variables")
+    
+    # Initialize model configuration for local development
+    try:
+        model_provider = os.environ.get('MODEL_PROVIDER', DEFAULT_MODEL_PROVIDER)
+        gemini_model = os.environ.get('GEMINI_MODEL', DEFAULT_GEMINI_MODEL)
+        openai_model = os.environ.get('OPENAI_MODEL', DEFAULT_OPENAI_MODEL)
+        initialize_model_config(model_provider, gemini_model, openai_model)
+        logger.info(f"Local model configuration loaded: {model_provider}")
+    except Exception as e:
+        logger.warning(f"Failed to load local model config: {e}. Using defaults.")
+        initialize_model_config(DEFAULT_MODEL_PROVIDER, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_MODEL)
     
     # Initialize AWS clients for local environment
     global ssm, s3_client, polly
