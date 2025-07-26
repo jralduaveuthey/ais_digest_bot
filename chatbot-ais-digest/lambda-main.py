@@ -671,13 +671,136 @@ def send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
             except Exception as e:
                 logger.error(f"Error sending message chunk {i+1}/{len(chunks)} to Telegram: {str(e)}")
 
-def handle_agent_send_email(args, mailgun_api_key, mailgun_domain):
-    """Handle email sending for agent mode."""
+def add_mention_to_agent_mentions_task(task_description, details, original_text, notion_token):
+    """Add a mention to JaimeRV in the Agent Mentions task."""
+    from datetime import datetime
+    
+    # Initialize Notion client
+    notion = NotionClient(auth=notion_token)
+    
+    # The specific Agent Mentions task page ID from the URL
+    agent_mentions_page_id = "23cfcfd1de9d80b58251ec5aa9c74d24"
+    
+    try:
+        # Create blocks for the new mention section
+        mention_blocks = [
+            {
+                "object": "block",
+                "type": "divider",
+                "divider": {}
+            },
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": f"Task from Telegram Agent - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "user",
+                                "user": {"id": NOTION_JAIME_USER_ID}
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " - New task reminder from Telegram Agent:"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": "Task Description"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": f"{task_description}\n\n{details}"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": "Original Telegram Message"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "quote",
+                "quote": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": original_text
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+        
+        # Append the blocks to the Agent Mentions page
+        notion.blocks.children.append(
+            block_id=agent_mentions_page_id,
+            children=mention_blocks
+        )
+        
+        return True, "Mention added to Agent Mentions task"
+    except Exception as e:
+        logger.error(f"Failed to add mention to Agent Mentions task: {str(e)}")
+        return False, str(e)
+
+def handle_agent_send_email(args, mailgun_api_key, mailgun_domain, notion_token):
+    """Handle email sending for agent mode and add Notion mention."""
     recipient = args.get("recipient", "jaime.raldua.veuthey@gmail.com")
     task_description = args.get("task_description", "Task from Telegram Agent")
     details = args.get("details", "")
     original_text = args.get("original_text", "")
     
+    # First, add mention to Notion
+    notion_success, notion_result = add_mention_to_agent_mentions_task(
+        task_description, details, original_text, notion_token
+    )
+    
+    # Then send email
     subject = f"[Telegram Agent] {task_description}"
     
     html_content = f"""
@@ -716,14 +839,32 @@ def handle_agent_send_email(args, mailgun_api_key, mailgun_domain):
             }
         )
         
-        if response.status_code == 200:
+        email_success = response.status_code == 200
+        if email_success:
             result = response.json()
-            return True, f"Email sent to {recipient} (ID: {result.get('id', 'Success')})"
+            email_msg = f"Email sent to {recipient} (ID: {result.get('id', 'Success')})"
         else:
-            return False, f"Failed to send email: {response.status_code} - {response.text}"
+            email_msg = f"Failed to send email: {response.status_code} - {response.text}"
+        
+        # Combine results
+        combined_results = []
+        if email_success:
+            combined_results.append(email_msg)
+        else:
+            combined_results.append(f"Email error: {email_msg}")
+            
+        if notion_success:
+            combined_results.append("Notion mention added")
+        else:
+            combined_results.append(f"Notion error: {notion_result}")
+        
+        # Return overall success only if both succeeded
+        overall_success = email_success and notion_success
+        return overall_success, " | ".join(combined_results)
+        
     except Exception as e:
         logger.error(f"Failed to send agent email: {str(e)}")
-        return False, str(e)
+        return False, f"Email error: {str(e)} | Notion: {'Success' if notion_success else notion_result}"
 
 def handle_agent_create_notion_task(args, notion_token):
     """Handle Notion task creation for agent mode."""
@@ -1119,7 +1260,7 @@ User request: {text}"""
             
             # Execute the appropriate function
             if function_name == "send_email":
-                success, result = handle_agent_send_email(function_args, MAILGUN_API_KEY, MAILGUN_DOMAIN)
+                success, result = handle_agent_send_email(function_args, MAILGUN_API_KEY, MAILGUN_DOMAIN, NOTION_TOKEN)
                 if success:
                     return f"✅ {result}"
                 else:
