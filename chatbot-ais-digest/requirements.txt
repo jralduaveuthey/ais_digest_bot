@@ -9,3 +9,4 @@ youtube-transcript-api==0.6.2
 pydantic==1.10.18
 google-generativeai==0.4.1
 python-dotenv==1.0.0
+notion-client==2.2.1

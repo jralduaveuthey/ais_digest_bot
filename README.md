@@ -26,6 +26,12 @@ cd ais_digest_bot
 pipenv install
 ```
 
+#### Required Services
+- **Telegram Bot**: Create via [@BotFather](https://t.me/botfather)
+- **OpenAI API**: Get API key from [OpenAI Platform](https://platform.openai.com/)
+- **Mailgun**: Sign up at [Mailgun](https://www.mailgun.com/) for email functionality
+- **Notion Integration**: Create an integration at [Notion Developers](https://developers.notion.com/)
+
 ### 3. Configure Environment Variables
 
 #### For Local Development
@@ -48,6 +54,11 @@ pipenv install
    
    # Allowed users (comma-separated Telegram usernames or IDs)
    USERS_ALLOWED=username1,username2,12345678
+   
+   # Additional services
+   MAILGUN_API_KEY=your_mailgun_api_key
+   MAILGUN_DOMAIN=your_mailgun_domain
+   NOTION_TOKEN_TASK_MASTER=your_notion_integration_token
    ```
 
 #### For AWS Deployment
@@ -102,14 +113,36 @@ Based on this detection:
 - **Logging**: Local logs to file, AWS logs to CloudWatch
 
 ## Bot Commands
-- `/new` - Start a new conversation
-- `/stampy` - Ask Stampy AI
-- `/transcript` - Get transcript of linked content
-- `/exam` - Test your understanding
-- `/reflect` - Solo reflection mode
+
+- `/new` - Start new conversation
+- `/agent` - Activate AI agent mode for task automation (email reminders, Notion tasks)
+- `/email` - Send conversation summary via email (add text after command for additional info)
+- `/retrieve` - Retrieve unprocessed content from content processor
+- `/exam` - Check your understanding
+- `/reflect` - Solo Reflection
 - `/journal` - Private journaling
-- `/journalgpt` - Journal with AI assistance
-- `/retrieve` - Retrieve unprocessed content
+- `/journalgpt` - Journal with AI assistant
+- `/stampy` - Ask question to Stampy (stampy.ai/chat/)   
+- `/transcript` - Returns transcript or jina link
+
+### Agent Mode (/agent)
+
+The agent mode allows you to automate tasks using natural language. When activated, the bot can:
+
+- **Send Email Reminders**: Automatically send emails with task descriptions
+- **Create Notion Tasks**: Create tasks in your Notion database with due dates
+
+Examples:
+```
+/agent
+Send me an email to remind me to do the dishes before tomorrow
+Create a Notion task to review the quarterly report
+Email john@example.com about the meeting preparation
+```
+
+To exit agent mode, use the `/new` command.
+
+**Note**: Agent mode always uses OpenAI's function calling capability with the model specified in `OPENAI_MODEL` (e.g., o4-mini), regardless of your default model provider configuration. Ensure your OpenAI API key is configured.
 
 ## Troubleshooting
 
@@ -121,3 +154,8 @@ Ensure `TELEGRAM_BOT_TOKEN_AIS_Digest_local` is set in `.env`
 
 ### AWS Parameter Store Fallback
 Some parameters (like `AUX_USERNAME`) may still be fetched from AWS even when running locally if not defined in `.env`
+
+### Agent Mode Issues
+- Ensure `NOTION_TOKEN_TASK_MASTER` is set in `.env` for Notion integration
+- Verify `MAILGUN_API_KEY` and `MAILGUN_DOMAIN` are configured for email functionality
+- Agent mode always uses OpenAI API - ensure `OPENAI_API_KEY` is configured even if using Gemini as default

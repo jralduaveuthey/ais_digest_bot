@@ -19,6 +19,7 @@ import tiktoken
 import openai
 import google.generativeai as genai
 import os
+from notion_client import Client as NotionClient
 
 # Environment detection function (defined early for logging setup)
 def is_running_in_lambda():
@@ -98,6 +99,7 @@ List of bot commands:
 /journalgpt - Journal with AI assistant
 /retrieve - Retrieve unprocessed content from content processor
 /email - Send conversation summary via email (add text after command for additional info)
+/agent - Activate AI agent mode for task automation (email, Notion tasks)
 """
 
 prompt_template = """The following is a friendly conversation between a human and an AI. 
@@ -127,6 +129,11 @@ MAILGUN_DOMAIN_SSM_PATH = '/chatbot-ais-digest/MAILGUN_DOMAIN'
 MODEL_PROVIDER_SSM_PATH = '/chatbot-ais-digest/MODEL_PROVIDER'
 GEMINI_MODEL_SSM_PATH = '/chatbot-ais-digest/GEMINI_MODEL'
 OPENAI_MODEL_SSM_PATH = '/chatbot-ais-digest/OPENAI_MODEL'
+NOTION_TOKEN_SSM_PATH = '/chatbot-ais-digest/NOTION_TOKEN_TASK_MASTER'
+
+# Notion configuration
+NOTION_TASKS_DATABASE_ID = "225fcfd1de9d800eae33de09d456e1d2"
+NOTION_JAIME_USER_ID = "104d872b-594c-81d1-a431-0002006e3bbe"
 
 # Content processor settings
 CONTENT_PROCESSOR_BUCKET = "content-processor-110199781938"
@@ -176,16 +183,29 @@ class LLMClient:
         else:
             raise ValueError(f"Unsupported provider: {provider}")
         
-    def generate(self, messages: List[Dict[str, str]], max_retries: int = 1) -> str:
-        """Generate a response from the specified API."""
+    def generate(self, messages: List[Dict[str, str]], max_retries: int = 1, functions: List[Dict] = None, function_call: str = "auto") -> Union[str, Dict]:
+        """Generate a response from the specified API, optionally with function calling."""
         for attempt in range(max_retries):
             try:
                 if self.provider == "openai":
-                    response = openai.ChatCompletion.create(
-                        model=self.model_name,
-                        messages=messages
-                    )
-                    return response.choices[0].message.content
+                    kwargs = {
+                        "model": self.model_name,
+                        "messages": messages
+                    }
+                    if functions:
+                        kwargs["functions"] = functions
+                        kwargs["function_call"] = function_call
+                    
+                    response = openai.ChatCompletion.create(**kwargs)
+                    
+                    # Check if a function was called
+                    message = response.choices[0].message
+                    if hasattr(message, 'function_call') and message.function_call:
+                        return {
+                            "type": "function_call",
+                            "function_call": message.function_call
+                        }
+                    return message.content
                 elif self.provider == "gemini":
                     # Convert OpenAI-style messages to Gemini format
                     prompt_parts = []
@@ -263,6 +283,58 @@ class ConversationManager:
         
         return response
 
+# Agent mode function definitions for OpenAI
+AGENT_FUNCTIONS = [
+    {
+        "name": "send_email",
+        "description": "Send an email to remind about a task or action item",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "recipient": {
+                    "type": "string",
+                    "description": "Email address of the recipient. If not specified, defaults to jaime.raldua.veuthey@gmail.com"
+                },
+                "task_description": {
+                    "type": "string",
+                    "description": "Short description of what needs to be done"
+                },
+                "details": {
+                    "type": "string",
+                    "description": "Detailed information about the task"
+                },
+                "original_text": {
+                    "type": "string",
+                    "description": "The original text from the user's Telegram message"
+                }
+            },
+            "required": ["task_description", "details", "original_text"]
+        }
+    },
+    {
+        "name": "create_notion_task",
+        "description": "Create a task in Notion with a due date of tomorrow",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_title": {
+                    "type": "string",
+                    "description": "Title of the task (without the prefix, it will be added automatically)"
+                },
+                "task_details": {
+                    "type": "string",
+                    "description": "Detailed description of what needs to be done"
+                },
+                "original_text": {
+                    "type": "string",
+                    "description": "The original text from the user's Telegram message"
+                }
+            },
+            "required": ["task_title", "task_details", "original_text"]
+        }
+    }
+]
+
 def save_journal_entry(entry, S3_BUCKET, journal_type):
     filename = JOURNAL_FILE if journal_type == "journal" else JOURNALGPT_FILE
     try:
@@ -334,6 +406,15 @@ def is_in_journal_mode(username, S3_BUCKET):
     conversation_history = load_conversation_history(username, S3_BUCKET)
     for message, _ in reversed(conversation_history):
         if message.strip().lower() == "/journal":
+            return True
+        elif message.strip().lower().startswith("/"):
+            return False
+    return False
+
+def is_in_agent_mode(username, S3_BUCKET):
+    conversation_history = load_conversation_history(username, S3_BUCKET)
+    for message, _ in reversed(conversation_history):
+        if message.strip().lower() == "/agent":
             return True
         elif message.strip().lower().startswith("/"):
             return False
@@ -590,6 +671,198 @@ def send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, text):
             except Exception as e:
                 logger.error(f"Error sending message chunk {i+1}/{len(chunks)} to Telegram: {str(e)}")
 
+def handle_agent_send_email(args, mailgun_api_key, mailgun_domain):
+    """Handle email sending for agent mode."""
+    recipient = args.get("recipient", "jaime.raldua.veuthey@gmail.com")
+    task_description = args.get("task_description", "Task from Telegram Agent")
+    details = args.get("details", "")
+    original_text = args.get("original_text", "")
+    
+    subject = f"[Telegram Agent] {task_description}"
+    
+    html_content = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2>Task Reminder from Telegram Agent</h2>
+        <p><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        
+        <h3>Task Description:</h3>
+        <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px;">
+            <p><strong>{task_description}</strong></p>
+            <p>{details}</p>
+        </div>
+        
+        <h3>Original Telegram Message:</h3>
+        <div style="background-color: #e8f4f8; padding: 15px; border-radius: 5px; font-style: italic;">
+            <p>{original_text}</p>
+        </div>
+        
+        <p style="margin-top: 20px; font-size: 12px; color: #666;">
+            This email was automatically generated by the Telegram AI Agent
+        </p>
+    </body>
+    </html>
+    """
+    
+    try:
+        response = requests.post(
+            f"https://api.mailgun.net/v3/{mailgun_domain}/messages",
+            auth=("api", mailgun_api_key),
+            data={
+                "from": f"Telegram Agent <mailgun@{mailgun_domain}>",
+                "to": [recipient],
+                "subject": subject,
+                "html": html_content
+            }
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return True, f"Email sent to {recipient} (ID: {result.get('id', 'Success')})"
+        else:
+            return False, f"Failed to send email: {response.status_code} - {response.text}"
+    except Exception as e:
+        logger.error(f"Failed to send agent email: {str(e)}")
+        return False, str(e)
+
+def handle_agent_create_notion_task(args, notion_token):
+    """Handle Notion task creation for agent mode."""
+    from datetime import datetime, timedelta
+    
+    task_title = args.get("task_title", "Task")
+    task_details = args.get("task_details", "")
+    original_text = args.get("original_text", "")
+    
+    # Initialize Notion client
+    notion = NotionClient(auth=notion_token)
+    
+    # Calculate tomorrow's date
+    tomorrow = (datetime.now() + timedelta(days=1)).date().isoformat()
+    
+    # Create the task properties
+    properties = {
+        "Task name": {
+            "title": [
+                {
+                    "text": {
+                        "content": f"(Telegram Jaime Agent) {task_title}"
+                    }
+                }
+            ]
+        },
+        "Due Date": {
+            "date": {
+                "start": tomorrow
+            }
+        },
+        "Assign": {
+            "people": [
+                {
+                    "id": NOTION_JAIME_USER_ID
+                }
+            ]
+        }
+    }
+    
+    try:
+        # Create the task page
+        page = notion.pages.create(
+            parent={"database_id": NOTION_TASKS_DATABASE_ID},
+            properties=properties
+        )
+        
+        # Add comment with mention to JaimeRV
+        comment_blocks = [
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "user",
+                                "user": {"id": NOTION_JAIME_USER_ID}
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " This task was created from the Telegram Jaime Agent bot."
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": "Task Details"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": task_details
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": "Original Telegram Message"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "quote",
+                "quote": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": original_text
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+        
+        # Add the comment blocks to the page
+        notion.blocks.children.append(
+            block_id=page["id"],
+            children=comment_blocks
+        )
+        
+        # Generate the Notion page URL
+        page_id = page["id"].replace("-", "")
+        notion_url = f"https://www.notion.so/{page_id}"
+        
+        return True, f"Task created in Notion: '{task_title}' (due {tomorrow})\n🔗 {notion_url}"
+    except Exception as e:
+        logger.error(f"Failed to create Notion task: {str(e)}")
+        return False, f"Failed to create task: {str(e)}"
+
 def send_email_via_mailgun(recipient_email, subject, conversation_data, additional_info="", mailgun_api_key=None, mailgun_domain=None):
     """Send email using Mailgun API with conversation summary."""
     try:
@@ -806,6 +1079,69 @@ def handle_context_length(text: str, conversation: ConversationManager, TELEGRAM
             return "Sorry, I'm currently out of credits. Please try again later."
         else:
             raise e
+
+def handle_agent_mode(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, MAILGUN_API_KEY: str, MAILGUN_DOMAIN: str, NOTION_TOKEN: str) -> str:
+    """Handle agent mode interactions with function calling."""
+    # Prepare the agent prompt
+    agent_prompt = f"""You are an AI agent that helps users automate tasks. Based on the user's request, determine which function to call.
+    
+Available functions:
+1. send_email - Send an email reminder about a task
+2. create_notion_task - Create a task in Notion with tomorrow as the due date
+
+Analyze the user's request and call the appropriate function. If the request mentions both email and Notion, prioritize based on what seems to be the primary intent.
+
+User request: {text}"""
+    
+    # Create messages for OpenAI
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant that can send emails and create Notion tasks."},
+        {"role": "user", "content": agent_prompt}
+    ]
+    
+    try:
+        # Always use OpenAI for agent mode (function calling)
+        # Use the configured OpenAI model (e.g., o4-mini) from the environment
+        agent_model = OPENAI_MODEL  # Uses the OPENAI_MODEL from config
+        llm_client = LLMClient(provider="openai", api_key=OPENAI_API_KEY, model_name=agent_model)
+        
+        # Generate response with function calling
+        response = llm_client.generate(messages, functions=AGENT_FUNCTIONS)
+        
+        if isinstance(response, dict) and response.get("type") == "function_call":
+            function_call = response["function_call"]
+            function_name = function_call.name
+            function_args = json.loads(function_call.arguments)
+            
+            # Add original text to args if not present
+            if "original_text" not in function_args:
+                function_args["original_text"] = text
+            
+            # Execute the appropriate function
+            if function_name == "send_email":
+                success, result = handle_agent_send_email(function_args, MAILGUN_API_KEY, MAILGUN_DOMAIN)
+                if success:
+                    return f"✅ {result}"
+                else:
+                    return f"❌ Error: {result}"
+            
+            elif function_name == "create_notion_task":
+                success, result = handle_agent_create_notion_task(function_args, NOTION_TOKEN)
+                if success:
+                    return f"✅ {result}"
+                else:
+                    return f"❌ Error: {result}"
+            
+            else:
+                return f"Unknown function: {function_name}"
+        
+        else:
+            # If no function was called, return the AI's response
+            return f"I understood your request but couldn't determine the appropriate action. Response: {response}"
+    
+    except Exception as e:
+        logger.error(f"Error in agent mode: {str(e)}")
+        return f"❌ Error processing agent command: {str(e)}"
 
 def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, GOOGLE_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, model_name: str) -> str:
     conversation_history = load_conversation_history(username, S3_BUCKET)
@@ -1047,6 +1383,7 @@ def lambda_handler(event, context):
         RAPIDAPI_KEY = get_parameter(ssm, RAPIDAPI_KEY_SSM_PATH)
         MAILGUN_API_KEY = get_parameter(ssm, MAILGUN_API_KEY_SSM_PATH)
         MAILGUN_DOMAIN = get_parameter(ssm, MAILGUN_DOMAIN_SSM_PATH)
+        NOTION_TOKEN = get_parameter(ssm, NOTION_TOKEN_SSM_PATH)
 
         print(f"DEBUG: The event received is: {event}")
         message = json.loads(event['body'])['message']
@@ -1280,6 +1617,13 @@ def lambda_handler(event, context):
                 'statusCode': 200,
                 'body': json.dumps('Retrieve request processed.')
             }
+        elif text.strip().lower() == "/agent":
+            response = "🤖 Agent mode activated! I can now help you:\n\n• Send email reminders\n• Create tasks in Notion\n\nJust tell me what you need to do, and I'll handle it for you.\n\nExamples:\n- 'Send me an email to remind me to do the dishes before tomorrow'\n- 'Create a Notion task to review the quarterly report'\n\nUse /new to exit agent mode."
+        elif is_in_agent_mode(current_user, S3_BUCKET):
+            if text.strip().lower() == "/new":
+                response = "Agent mode deactivated. Your messages will now be processed normally."
+            else:
+                response = handle_agent_mode(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MAILGUN_API_KEY, MAILGUN_DOMAIN, NOTION_TOKEN)
         elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
             parsed_url = urlparse(text)
             print(f"DEBUG: The parsed_url that will be passed for the normal processing is '{parsed_url}'")
