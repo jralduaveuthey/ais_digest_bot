@@ -88,6 +88,9 @@ def initialize_model_config(model_provider, gemini_model, openai_model):
 #--------------------------------------------------#
 
 #-------------------BOT SETTINGS-------------------#
+# Configuration for email functionality
+ENABLE_NOTION_MENTIONS_ON_EMAIL = False  # Set to True to also create Notion mentions when sending emails
+
 """
 List of bot commands:
 /new - Start new conversation
@@ -789,16 +792,19 @@ def add_mention_to_agent_mentions_task(task_description, details, original_text,
         return False, str(e)
 
 def handle_agent_send_email(args, mailgun_api_key, mailgun_domain, notion_token):
-    """Handle email sending for agent mode and add Notion mention."""
+    """Handle email sending for agent mode and optionally add Notion mention."""
     recipient = args.get("recipient", "jaime.raldua.veuthey@gmail.com")
     task_description = args.get("task_description", "Task from Telegram Agent")
     details = args.get("details", "")
     original_text = args.get("original_text", "")
     
-    # First, add mention to Notion
-    notion_success, notion_result = add_mention_to_agent_mentions_task(
-        task_description, details, original_text, notion_token
-    )
+    # Check if Notion mentions are enabled
+    notion_success = True
+    notion_result = "Notion mentions disabled"
+    if ENABLE_NOTION_MENTIONS_ON_EMAIL:
+        notion_success, notion_result = add_mention_to_agent_mentions_task(
+            task_description, details, original_text, notion_token
+        )
     
     # Then send email
     subject = f"[Telegram Agent] {task_description}"
@@ -853,18 +859,26 @@ def handle_agent_send_email(args, mailgun_api_key, mailgun_domain, notion_token)
         else:
             combined_results.append(f"Email error: {email_msg}")
             
-        if notion_success:
-            combined_results.append("Notion mention added")
-        else:
-            combined_results.append(f"Notion error: {notion_result}")
+        # Only include Notion results if the feature is enabled
+        if ENABLE_NOTION_MENTIONS_ON_EMAIL:
+            if notion_success:
+                combined_results.append("Notion mention added")
+            else:
+                combined_results.append(f"Notion error: {notion_result}")
         
-        # Return overall success only if both succeeded
-        overall_success = email_success and notion_success
+        # Return overall success based on what features are enabled
+        if ENABLE_NOTION_MENTIONS_ON_EMAIL:
+            overall_success = email_success and notion_success
+        else:
+            overall_success = email_success
         return overall_success, " | ".join(combined_results)
         
     except Exception as e:
         logger.error(f"Failed to send agent email: {str(e)}")
-        return False, f"Email error: {str(e)} | Notion: {'Success' if notion_success else notion_result}"
+        if ENABLE_NOTION_MENTIONS_ON_EMAIL:
+            return False, f"Email error: {str(e)} | Notion: {'Success' if notion_success else notion_result}"
+        else:
+            return False, f"Email error: {str(e)}"
 
 def handle_agent_create_notion_task(args, notion_token):
     """Handle Notion task creation for agent mode."""
