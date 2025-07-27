@@ -113,17 +113,18 @@ Based on this detection:
 - **Logging**: Local logs to file, AWS logs to CloudWatch
 
 ## Bot Commands
-
-- `/new` - Start new conversation
-- `/agent` - Activate AI agent mode for task automation (email reminders, Notion tasks)
-- `/email` - Send conversation summary via email (add text after command for additional info)
-- `/retrieve` - Retrieve unprocessed content from content processor
-- `/exam` - Check your understanding
-- `/reflect` - Solo Reflection
-- `/journal` - Private journaling
-- `/journalgpt` - Journal with AI assistant
-- `/stampy` - Ask question to Stampy (stampy.ai/chat/)   
-- `/transcript` - Returns transcript or jina link
+``` 
+new - Start new conversation
+agent - Activate AI agent mode for task automation (email reminders, Notion tasks)
+journal - Private journaling
+journalgpt - Journal with AI assistant
+email - Send conversation summary via email (add text after command for additional info)
+retrieve - Retrieve unprocessed content from content processor
+exam - Check your understanding
+reflect - Solo Refle  ction
+stampy - Ask question to Stampy (stampy.ai/chat/)   
+transcript - Returns transcript or jina link
+``` 
 
 ### Agent Mode (/agent)
 

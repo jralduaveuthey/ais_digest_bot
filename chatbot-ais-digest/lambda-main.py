@@ -4,7 +4,7 @@ import boto3
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 from typing import List, Dict, Any, Union, Tuple, Optional, Callable
 from contextlib import closing
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # Default fallback values (will be overridden by Parameter Store values)
 DEFAULT_MODEL_PROVIDER = "gemini"  # Options: "gemini", "openai"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_MODEL = "o4-mini"
 
 # These will be set after loading from Parameter Store
 MODEL_PROVIDER = None
@@ -80,7 +80,7 @@ def initialize_model_config(model_provider, gemini_model, openai_model):
         MAX_TOKENS = 1048576  # Gemini 2.0 Flash has 1M token context window
     elif MODEL_PROVIDER == "openai":
         DEFAULT_MODEL = OPENAI_MODEL
-        MAX_TOKENS = 128000  # GPT-4o-mini has 128K token context window
+        MAX_TOKENS = 128000  # o4-mini has 128K token context window
     else:
         raise ValueError(f"Unsupported model provider: {MODEL_PROVIDER}")
     
@@ -98,8 +98,8 @@ List of bot commands:
 /transcript - Returns transcript or jina link
 /exam - Check your understanding
 /reflect - Solo Reflection
-/journal - Private journaling
-/journalgpt - Journal with AI assistant
+/journal - Private journaling to Notion database
+/journalgpt - Journal with AI coach assistant (saves conversation to Notion)
 /retrieve - Retrieve unprocessed content from content processor
 /email - Send conversation summary via email (add text after command for additional info)
 /agent - Activate AI agent mode for task automation (email, Notion tasks)
@@ -133,10 +133,12 @@ MODEL_PROVIDER_SSM_PATH = '/chatbot-ais-digest/MODEL_PROVIDER'
 GEMINI_MODEL_SSM_PATH = '/chatbot-ais-digest/GEMINI_MODEL'
 OPENAI_MODEL_SSM_PATH = '/chatbot-ais-digest/OPENAI_MODEL'
 NOTION_TOKEN_SSM_PATH = '/chatbot-ais-digest/NOTION_TOKEN_TASK_MASTER'
+NOTION_JRV_TOKEN_SSM_PATH = '/chatbot-ais-digest/NOTION_JRV_NTN_INTEGRATION'
 
 # Notion configuration
 NOTION_TASKS_DATABASE_ID = "225fcfd1de9d800eae33de09d456e1d2"
 NOTION_JAIME_USER_ID = "104d872b-594c-81d1-a431-0002006e3bbe"
+NOTION_JRV_JOURNAL_DATABASE_ID = "23d298d80cb28007aaadc20e1b50f7ff"
 
 # Content processor settings
 CONTENT_PROCESSOR_BUCKET = "content-processor-110199781938"
@@ -167,9 +169,8 @@ else:
     ssm = None
     s3_client = None
     polly = None
+    # Note: s3_client is initialized later in main() for local development
 
-JOURNAL_FILE = "userlogs/journal.json"
-JOURNALGPT_FILE = "userlogs/journalgpt.json"
 
 # Custom API Client Wrapper
 class LLMClient:
@@ -286,6 +287,175 @@ class ConversationManager:
         
         return response
 
+# Mode Management System
+class ModeManager:
+    """Centralized mode management to handle state transitions and persistence."""
+    
+    def __init__(self):
+        self.modes = {
+            'normal': 'normal',
+            'journal': 'journal',
+            'journalgpt': 'journalgpt',
+            'agent': 'agent'
+        }
+        self.mode_commands = {
+            '/journal': 'journal',
+            '/journalgpt': 'journalgpt',
+            '/agent': 'agent',
+            '/new': 'normal'  # Special case: always returns to normal
+        }
+        # In-memory cache for current Lambda execution
+        self._mode_cache = {}
+    
+    def get_current_mode(self, username: str, S3_BUCKET: str) -> str:
+        """Get the current mode for a user by checking their mode state."""
+        # First try to load from mode state file
+        mode_state = self._load_mode_state(username, S3_BUCKET)
+        if mode_state:
+            mode = mode_state.get('mode', 'normal')
+            logger.info(f"ModeManager: Loaded mode '{mode}' from state file for user {username}")
+            return mode
+        
+        # Fallback to history-based detection for backward compatibility
+        logger.info(f"ModeManager: No state file found for {username}, checking history")
+        full_history = load_full_conversation_history(username, S3_BUCKET)
+        logger.info(f"ModeManager: Checking {len(full_history)} messages for mode commands")
+        
+        # Check history in reverse order (most recent first)
+        for i, (message, _) in enumerate(reversed(full_history)):
+            cmd = message.strip().lower()
+            logger.debug(f"ModeManager: Checking message {i}: '{cmd}'")
+            
+            if cmd in self.mode_commands:
+                mode = self.mode_commands[cmd]
+                logger.info(f"ModeManager: Found mode '{mode}' from history command '{cmd}' at position {i}")
+                return mode
+            elif cmd.startswith('/') and cmd not in self.mode_commands:
+                # If we hit a non-mode command, we're in normal mode
+                logger.info(f"ModeManager: Found non-mode command '{cmd}' at position {i}, assuming normal mode")
+                # Don't return here - keep checking in case there's a mode command before this
+        
+        logger.info(f"ModeManager: No mode command found in history, defaulting to 'normal' for {username}")
+        return 'normal'
+    
+    def process_mode_command(self, text: str, username: str, S3_BUCKET: str) -> Tuple[Optional[str], Optional[str]]:
+        """Process mode commands and return (new_mode, response)."""
+        cmd = text.strip().lower()
+        
+        if cmd not in self.mode_commands:
+            return None, None
+        
+        new_mode = self.mode_commands[cmd]
+        current_mode = self.get_current_mode(username, S3_BUCKET)
+        
+        # Save the new mode state
+        self._save_mode_state(username, S3_BUCKET, new_mode)
+        
+        # Generate appropriate response
+        if cmd == '/new':
+            if current_mode == 'journal':
+                return 'normal', "Journal mode deactivated. Your messages will now be processed normally."
+            elif current_mode == 'journalgpt':
+                return 'normal', "JournalGPT mode deactivated. Your messages will now be processed normally."
+            elif current_mode == 'agent':
+                return 'normal', "Agent mode deactivated. Your messages will now be processed normally."
+            else:
+                return 'normal', "(/new) Let's start a new conversation."
+        elif cmd == '/journal':
+            return 'journal', "📓 Journal mode activated. Your messages will be saved as journal entries in Notion. Use /new to exit journal mode."
+        elif cmd == '/journalgpt':
+            return 'journalgpt', "📓 JournalGPT mode activated. You're now in a conversation with an AI coach journaling assistant. Send your first message to begin.\n\nUse /new to exit JournalGPT mode."
+        elif cmd == '/agent':
+            return 'agent', "🤖 Agent mode activated! I can now help you:\n\n• Send email reminders\n• Create tasks in Notion\n\nJust tell me what you need to do, and I'll handle it for you.\n\nExamples:\n- 'Send me an email to remind me to do the dishes before tomorrow'\n- 'Create a Notion task to review the quarterly report'\n\nUse /new to exit agent mode."
+        
+        return new_mode, None
+    
+    def _load_mode_state(self, username: str, S3_BUCKET: str) -> dict:
+        """Load mode state from S3 or local file."""
+        try:
+            if not s3_client:
+                # Try local file fallback for development
+                return self._load_local_mode_state(username)
+            
+            filename = f"mode_state/{username}.json"
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
+            state = json.loads(response['Body'].read().decode('utf-8'))
+            logger.info(f"ModeManager: Loaded state from S3: {state}")
+            return state
+        except AttributeError:
+            logger.warning("ModeManager: S3 client not available, trying local file")
+            return self._load_local_mode_state(username)
+        except s3_client.exceptions.NoSuchKey:
+            logger.info(f"ModeManager: No state file found in S3 for {username}")
+            return None
+        except Exception as e:
+            logger.warning(f"ModeManager: Error loading mode state from S3: {e}")
+            return self._load_local_mode_state(username)
+    
+    def _save_mode_state(self, username: str, S3_BUCKET: str, mode: str):
+        """Save mode state to S3 or local file."""
+        state = {
+            'mode': mode,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'version': '1.0'
+        }
+        
+        try:
+            if not s3_client:
+                # Save to local file for development
+                self._save_local_mode_state(username, state)
+                return
+            
+            filename = f"mode_state/{username}.json"
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=filename,
+                Body=json.dumps(state)
+            )
+            logger.info(f"ModeManager: Saved mode '{mode}' to S3 for user {username}")
+        except AttributeError:
+            logger.error("ModeManager: S3 client not available, saving to local file")
+            self._save_local_mode_state(username, state)
+        except Exception as e:
+            logger.error(f"ModeManager: Error saving mode state to S3: {e}")
+            self._save_local_mode_state(username, state)
+    
+    def _load_local_mode_state(self, username: str) -> dict:
+        """Load mode state from local file (for development)."""
+        try:
+            local_dir = os.path.dirname(os.path.abspath(__file__))
+            mode_dir = os.path.join(local_dir, '.mode_state')
+            filename = os.path.join(mode_dir, f"{username}.json")
+            
+            if os.path.exists(filename):
+                with open(filename, 'r') as f:
+                    state = json.load(f)
+                logger.info(f"ModeManager: Loaded state from local file: {state}")
+                return state
+            return None
+        except Exception as e:
+            logger.warning(f"ModeManager: Error loading local mode state: {e}")
+            return None
+    
+    def _save_local_mode_state(self, username: str, state: dict):
+        """Save mode state to local file (for development)."""
+        try:
+            local_dir = os.path.dirname(os.path.abspath(__file__))
+            mode_dir = os.path.join(local_dir, '.mode_state')
+            
+            # Create directory if it doesn't exist
+            os.makedirs(mode_dir, exist_ok=True)
+            
+            filename = os.path.join(mode_dir, f"{username}.json")
+            with open(filename, 'w') as f:
+                json.dump(state, f)
+            logger.info(f"ModeManager: Saved mode state to local file for {username}")
+        except Exception as e:
+            logger.error(f"ModeManager: Error saving local mode state: {e}")
+
+# Initialize mode manager globally
+mode_manager = ModeManager()
+
 # Agent mode function definitions for OpenAI
 AGENT_FUNCTIONS = [
     {
@@ -338,43 +508,59 @@ AGENT_FUNCTIONS = [
     }
 ]
 
-def save_journal_entry(entry, S3_BUCKET, journal_type):
-    filename = JOURNAL_FILE if journal_type == "journal" else JOURNALGPT_FILE
-    try:
-        try:
-            # Try to get the existing file
-            response = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
-            data = json.loads(response['Body'].read().decode('utf-8'))
-        except s3_client.exceptions.NoSuchKey:
-            # If the file doesn't exist, create an empty list
-            data = []
-
-        timestamp = int(time.time())
-        entry_data = {
-            "timestamp": timestamp,
-            "human_readable_date": datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
-            "entry": entry
+def handle_journal_mode(text: str, notion_jrv_token: str) -> str:
+    """Handle journal mode with Notion integration."""
+    import uuid
+    
+    # Initialize Notion client with JRV token
+    notion = NotionClient(auth=notion_jrv_token)
+    
+    # Generate unique ID
+    unique_id = str(uuid.uuid4())
+    
+    # Create the journal entry properties
+    properties = {
+        "ID": {
+            "title": [
+                {
+                    "text": {
+                        "content": unique_id
+                    }
+                }
+            ]
+        },
+        "Raw entry": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": text
+                    }
+                }
+            ]
         }
-        data.append(entry_data)
-
-        # Save the updated data back to S3
-        s3_client.put_object(Bucket=S3_BUCKET, Key=filename, Body=json.dumps(data))
+    }
+    
+    try:
+        # Create the journal entry page
+        page = notion.pages.create(
+            parent={"database_id": NOTION_JRV_JOURNAL_DATABASE_ID},
+            properties=properties
+        )
         
-        print(f"Journal entry saved successfully to {filename}")
+        # Generate the Notion page URL
+        page_id = page["id"].replace("-", "")
+        notion_url = f"https://www.notion.so/{page_id}"
+        
+        return f"✅ Journal entry saved to Notion\n🔗 {notion_url}"
     except Exception as e:
-        logging.error(f"Error saving journal entry: {str(e)}")
-        print(f"Error saving journal entry: {str(e)}")
+        logger.error(f"Failed to create journal entry: {str(e)}")
+        return f"❌ Failed to save journal entry: {str(e)}"
 
 def is_in_journalgpt_mode(username, S3_BUCKET):
-    conversation_history = load_conversation_history(username, S3_BUCKET)
-    for message, _ in reversed(conversation_history):
-        if message.strip().lower() == "/journalgpt":
-            return True
-        elif message.strip().lower().startswith("/"):
-            return False
-    return False
+    """DEPRECATED: Use mode_manager.get_current_mode() instead."""
+    return mode_manager.get_current_mode(username, S3_BUCKET) == 'journalgpt'
 
-def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name):
+def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name, notion_jrv_token):
     journalgpt_prompt_template = """You are an AI coach assistant for journaling. Your role is to provide supportive, 
     insightful, and thought-provoking responses to the user's journal entries. Encourage self-reflection, personal growth, 
     and emotional awareness. Be empathetic and non-judgmental in your responses. If appropriate, you may ask follow-up 
@@ -388,40 +574,309 @@ def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_AP
 
     conversation_history = load_conversation_history(username, S3_BUCKET)
     journalgpt_history = []
-    for message, response in reversed(conversation_history):
+    journalgpt_page_id = None
+    
+    # Find the journalgpt session start and any existing page ID
+    found_start = False
+    for i, (message, response) in enumerate(reversed(conversation_history)):
         if message.strip().lower() == "/journalgpt":
+            found_start = True
             break
         journalgpt_history.insert(0, (message, response))
-
-    # Create LLM client, memory, and conversation manager based on MODEL_PROVIDER
-    if MODEL_PROVIDER == "gemini":
-        llm_client = LLMClient(provider="gemini", api_key=GOOGLE_API_KEY, model_name=model_name)
+    
+    # If this is the first message after /journalgpt, create the initial entry
+    if found_start and len(journalgpt_history) == 0:
+        success, page_id, url = create_journalgpt_entry(text, notion_jrv_token)
+        if success:
+            journalgpt_page_id = page_id
+            # Store the URL in a special format so we can extract it later
+            journalgpt_url_marker = f"\n🔗 {url}\n"
+        else:
+            return f"❌ Failed to create journal entry: {url}"
     else:
-        llm_client = LLMClient(provider="openai", api_key=OPENAI_API_KEY, model_name=model_name)
+        journalgpt_url_marker = ""
+    
+    # Check if we have a page ID from a previous message
+    if not journalgpt_page_id and len(journalgpt_history) > 0:
+        logger.info(f"Looking for JournalGPT page ID in {len(journalgpt_history)} previous messages")
+        # Look for the URL in any of the AI responses (not just the first one)
+        for _, response in journalgpt_history:
+            if "notion.so/" in response:
+                import re
+                # Match Notion URLs with various formats
+                match = re.search(r'notion\.so/([a-fA-F0-9\-]+)', response)
+                if match:
+                    # Remove hyphens from the page ID
+                    journalgpt_page_id = match.group(1).replace('-', '')
+                    logger.info(f"Found JournalGPT page ID: {journalgpt_page_id}")
+                    break
+
+    # If we have a page ID, load the conversation from Notion
+    if journalgpt_page_id:
+        notion_conversation = get_journalgpt_conversation_from_notion(journalgpt_page_id, notion_jrv_token)
+        # Use Notion conversation as the history
+        journalgpt_history = notion_conversation
+    
+    # Create LLM client, memory, and conversation manager based on MODEL_PROVIDER
+    # Always use OpenAI's o4-mini for journalgpt mode to ensure consistent behavior
+    llm_client = LLMClient(provider="openai", api_key=OPENAI_API_KEY, model_name="o4-mini")
     
     memory = ConversationMemory(conversation_history=journalgpt_history)
     conversation = ConversationManager(llm_client, memory, journalgpt_prompt_template)
 
-    return handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, model_name)
+    # Get AI response
+    ai_response = handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, "o4-mini")
+    
+    # Update Notion page with the conversation
+    if journalgpt_page_id:
+        logger.info(f"Updating JournalGPT page {journalgpt_page_id} with new conversation")
+        # Pass the API key for summary generation
+        update_success = update_journalgpt_notion_page(journalgpt_page_id, text, ai_response, notion_jrv_token, OPENAI_API_KEY, "openai", "o4-mini")
+        if not update_success:
+            logger.error(f"Failed to update JournalGPT page {journalgpt_page_id}")
+    else:
+        logger.warning("No JournalGPT page ID found, conversation will not be saved to Notion")
+    
+    # If this was the first message, include the URL in the response
+    if journalgpt_url_marker:
+        return f"Journal entry created. Starting AI conversation...{journalgpt_url_marker}\n{ai_response}"
+    else:
+        return ai_response
+
+def create_journalgpt_entry(text: str, notion_jrv_token: str) -> tuple:
+    """Create initial JournalGPT entry in Notion and return (success, page_id, url)."""
+    import uuid
+    
+    # Initialize Notion client with JRV token
+    notion = NotionClient(auth=notion_jrv_token)
+    
+    # Generate unique ID
+    unique_id = str(uuid.uuid4())
+    
+    # Create the journal entry properties
+    properties = {
+        "ID": {
+            "title": [
+                {
+                    "text": {
+                        "content": unique_id
+                    }
+                }
+            ]
+        },
+        "Raw entry": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": text
+                    }
+                }
+            ]
+        }
+    }
+    
+    try:
+        # Create the journal entry page
+        page = notion.pages.create(
+            parent={"database_id": NOTION_JRV_JOURNAL_DATABASE_ID},
+            properties=properties
+        )
+        
+        # Generate the Notion page URL
+        page_id = page["id"].replace("-", "")
+        notion_url = f"https://www.notion.so/{page_id}"
+        
+        # Add initial AI conversation block
+        conversation_blocks = [
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": "AI Conversation"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": f"User: {text}"
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+        
+        # Add the blocks to the page
+        notion.blocks.children.append(
+            block_id=page["id"],
+            children=conversation_blocks
+        )
+        
+        return True, page_id, notion_url
+    except Exception as e:
+        logger.error(f"Failed to create journalgpt entry: {str(e)}")
+        return False, None, str(e)
+
+def update_journalgpt_notion_page(page_id: str, user_message: str, ai_response: str, notion_jrv_token: str, api_key: str = None, provider: str = None, model: str = None):
+    """Update the JournalGPT Notion page with new conversation."""
+    # Initialize Notion client with JRV token
+    notion = NotionClient(auth=notion_jrv_token)
+    
+    try:
+        # Add conversation blocks
+        conversation_blocks = [
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": f"\nUser: {user_message}"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "text": {
+                                "content": f"AI: {ai_response}"
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+        
+        # Append the blocks to the page
+        notion.blocks.children.append(
+            block_id=page_id,
+            children=conversation_blocks
+        )
+        
+        # Update the AI conversation summary property
+        update_ai_conversation_summary(page_id, notion_jrv_token, api_key, provider, model)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update journalgpt page: {str(e)}")
+        return False
+
+def update_ai_conversation_summary(page_id: str, notion_jrv_token: str, api_key: str = None, provider: str = None, model: str = None):
+    """Update the AI conversation summary property in the Notion page."""
+    # Initialize Notion client with JRV token
+    notion = NotionClient(auth=notion_jrv_token)
+    
+    try:
+        # First, get the full conversation from the page
+        conversation = get_journalgpt_conversation_from_notion(page_id, notion_jrv_token)
+        
+        if not conversation:
+            return
+        
+        # Create a summary of the conversation
+        conversation_text = "\n\n".join([f"User: {user}\nAI: {ai}" for user, ai in conversation])
+        
+        # Limit conversation text to avoid token limits
+        if len(conversation_text) > 10000:
+            conversation_text = conversation_text[-10000:]  # Keep last 10k chars
+        
+        # Create a prompt for summarization
+        summary_prompt = f"Please provide a concise summary of the following conversation between a user and an AI journaling coach:\n\n{conversation_text}\n\nSummary:"
+        
+        # Use provided parameters or defaults
+        if not provider:
+            provider = MODEL_PROVIDER
+        if not model:
+            model = GEMINI_MODEL if provider == "gemini" else OPENAI_MODEL
+        
+        # Skip if no API key provided
+        if not api_key:
+            logger.warning("No API key provided for AI conversation summary")
+            return
+            
+        llm_client = LLMClient(provider=provider, api_key=api_key, model_name=model)
+        
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that creates concise summaries."},
+            {"role": "user", "content": summary_prompt}
+        ]
+        
+        summary = llm_client.generate(messages)
+        
+        # Update the page properties with the summary
+        properties = {
+            "AI conversation summary": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": summary[:2000]  # Limit to 2000 chars for Notion property
+                        }
+                    }
+                ]
+            }
+        }
+        
+        notion.pages.update(page_id=page_id, properties=properties)
+        
+    except Exception as e:
+        logger.error(f"Failed to update AI conversation summary: {str(e)}")
+
+def get_journalgpt_conversation_from_notion(page_id: str, notion_jrv_token: str) -> list:
+    """Retrieve the conversation history from a JournalGPT Notion page."""
+    # Initialize Notion client with JRV token
+    notion = NotionClient(auth=notion_jrv_token)
+    
+    try:
+        # Get all blocks from the page
+        blocks = notion.blocks.children.list(block_id=page_id)
+        
+        conversation = []
+        current_user_msg = None
+        
+        for block in blocks['results']:
+            if block['type'] == 'paragraph':
+                text = ""
+                rich_text = block['paragraph'].get('rich_text', [])
+                for rt in rich_text:
+                    text += rt.get('text', {}).get('content', '')
+                
+                text = text.strip()
+                if text.startswith("User: "):
+                    current_user_msg = text[6:]  # Remove "User: " prefix
+                elif text.startswith("AI: ") and current_user_msg:
+                    ai_msg = text[4:]  # Remove "AI: " prefix
+                    conversation.append((current_user_msg, ai_msg))
+                    current_user_msg = None
+        
+        return conversation
+    except Exception as e:
+        logger.error(f"Failed to get conversation from Notion: {str(e)}")
+        return []
 
 
 def is_in_journal_mode(username, S3_BUCKET):
-    conversation_history = load_conversation_history(username, S3_BUCKET)
-    for message, _ in reversed(conversation_history):
-        if message.strip().lower() == "/journal":
-            return True
-        elif message.strip().lower().startswith("/"):
-            return False
-    return False
+    """DEPRECATED: Use mode_manager.get_current_mode() instead."""
+    return mode_manager.get_current_mode(username, S3_BUCKET) == 'journal'
 
 def is_in_agent_mode(username, S3_BUCKET):
-    conversation_history = load_conversation_history(username, S3_BUCKET)
-    for message, _ in reversed(conversation_history):
-        if message.strip().lower() == "/agent":
-            return True
-        elif message.strip().lower().startswith("/"):
-            return False
-    return False
+    """DEPRECATED: Use mode_manager.get_current_mode() instead."""
+    return mode_manager.get_current_mode(username, S3_BUCKET) == 'agent'
 
 def process_generic_link(url, max_attempts=5, initial_timeout=5, transcript_only=False):
     headers = {
@@ -1018,6 +1473,57 @@ def handle_agent_create_notion_task(args, notion_token):
         logger.error(f"Failed to create Notion task: {str(e)}")
         return False, f"Failed to create task: {str(e)}"
 
+def handle_agent_create_journal_entry(args, notion_jrv_token):
+    """Handle Notion journal entry creation for agent mode."""
+    from datetime import datetime
+    import uuid
+    
+    raw_entry = args.get("raw_entry", "")
+    
+    # Initialize Notion client with JRV token
+    notion = NotionClient(auth=notion_jrv_token)
+    
+    # Generate unique ID
+    unique_id = str(uuid.uuid4())
+    
+    # Create the journal entry properties
+    properties = {
+        "ID": {
+            "title": [
+                {
+                    "text": {
+                        "content": unique_id
+                    }
+                }
+            ]
+        },
+        "Raw entry": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": raw_entry
+                    }
+                }
+            ]
+        }
+    }
+    
+    try:
+        # Create the journal entry page
+        page = notion.pages.create(
+            parent={"database_id": NOTION_JRV_JOURNAL_DATABASE_ID},
+            properties=properties
+        )
+        
+        # Generate the Notion page URL
+        page_id = page["id"].replace("-", "")
+        notion_url = f"https://www.notion.so/{page_id}"
+        
+        return True, f"Journal entry created in Notion\\n🔗 {notion_url}"
+    except Exception as e:
+        logger.error(f"Failed to create journal entry: {str(e)}")
+        return False, f"Failed to create journal entry: {str(e)}"
+
 def send_email_via_mailgun(recipient_email, subject, conversation_data, additional_info="", mailgun_api_key=None, mailgun_domain=None):
     """Send email using Mailgun API with conversation summary."""
     try:
@@ -1235,7 +1741,7 @@ def handle_context_length(text: str, conversation: ConversationManager, TELEGRAM
         else:
             raise e
 
-def handle_agent_mode(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, MAILGUN_API_KEY: str, MAILGUN_DOMAIN: str, NOTION_TOKEN: str) -> str:
+def handle_agent_mode(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: str, TELEGRAM_BOT_TOKEN: str, chat_id: int, MAILGUN_API_KEY: str, MAILGUN_DOMAIN: str, NOTION_TOKEN: str, NOTION_JRV_TOKEN: str) -> str:
     """Handle agent mode interactions with function calling."""
     # Prepare the agent prompt
     agent_prompt = f"""You are an AI agent that helps users automate tasks. Based on the user's request, determine which function to call.
@@ -1256,7 +1762,7 @@ User request: {text}"""
     
     try:
         # Always use OpenAI for agent mode (function calling)
-        # Use the configured OpenAI model (e.g., o4-mini) from the environment
+        # Use the configured OpenAI model (o4-mini) from the environment
         agent_model = OPENAI_MODEL  # Uses the OPENAI_MODEL from config
         llm_client = LLMClient(provider="openai", api_key=OPENAI_API_KEY, model_name=agent_model)
         
@@ -1312,7 +1818,38 @@ def generate_response(text: str, username: str, S3_BUCKET: str, OPENAI_API_KEY: 
 
     return handle_context_length(text, conversation, TELEGRAM_BOT_TOKEN, chat_id, model_name)
 
+def load_full_conversation_history(username, S3_BUCKET):
+    """Load the full conversation history without any filtering - used for mode detection."""
+    filename = f"userlogs/{username}.json"
+    try:
+        if not s3_client:
+            logger.warning("load_full_conversation_history: S3 client not initialized")
+            return []
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
+        data = json.loads(response['Body'].read().decode('utf-8'))
+        full_history = [(item['text'], item['response']) for item in data]
+        
+        logger.info(f"load_full_conversation_history: Loaded {len(full_history)} messages for {username}")
+        if full_history:
+            # Log last few messages for debugging
+            logger.info(f"Last 3 messages: {[msg for msg, _ in full_history[-3:]]}")
+        
+        last_new_index = -1
+        for i, (text, _) in enumerate(reversed(full_history)):
+            # Only match /new as a command, not as part of a response
+            if text.strip().lower().startswith("/new"):
+                last_new_index = len(full_history) - i - 1
+                break
+        
+        result = full_history[last_new_index + 1:] if last_new_index != -1 else full_history
+        logger.info(f"Returning {len(result)} messages after last /new")
+        return result
+    except Exception as e:
+        logger.error(f"load_full_conversation_history error: {e}")
+        return []
+
 def load_conversation_history(username, S3_BUCKET):
+    """Load conversation history with proper mode-aware filtering."""
     filename = f"userlogs/{username}.json"
     try:
         response = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
@@ -1321,11 +1858,45 @@ def load_conversation_history(username, S3_BUCKET):
         
         last_new_index = -1
         for i, (text, _) in enumerate(reversed(full_history)):
-            if "/new" in text:
+            # Only match /new as a command, not as part of a response
+            if text.strip().lower().startswith("/new"):
                 last_new_index = len(full_history) - i - 1
                 break
         
-        return full_history[last_new_index + 1:] if last_new_index != -1 else full_history
+        # Get history after last /new
+        history = full_history[last_new_index + 1:] if last_new_index != -1 else full_history
+        
+        # Filter out mode activation commands and mode-specific entries
+        filtered_history = []
+        current_mode = 'normal'
+        mode_commands = {
+            '/journal': 'journal',
+            '/journalgpt': 'journalgpt', 
+            '/agent': 'agent',
+            '/new': 'normal'
+        }
+        
+        for text, response in history:
+            cmd = text.strip().lower()
+            
+            # Check if this is a mode command
+            if cmd in mode_commands:
+                current_mode = mode_commands[cmd]
+                # Skip mode activation commands from history
+                continue
+            
+            # Check for any command that might change mode
+            if cmd.startswith("/") and cmd not in mode_commands:
+                # Other commands don't change mode but should be included
+                filtered_history.append((text, response))
+            elif current_mode == 'journal':
+                # In journal mode, skip non-command messages
+                continue
+            else:
+                # In other modes, include the message
+                filtered_history.append((text, response))
+        
+        return filtered_history
     except Exception as e:
         print(f"WARNING: in load_conversation_history() there was an error: '{e}'")
         return []
@@ -1463,7 +2034,7 @@ def handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id):
                         if send_document_to_bot(TELEGRAM_BOT_TOKEN, chat_id, file_content, filename, caption):
                             # Mark as retrieved
                             item_data["retrieved"] = True
-                            item_data["retrieved_date"] = datetime.utcnow().isoformat() + "Z"
+                            item_data["retrieved_date"] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                             youtube_count += 1
                             total_delivered += 1
                             
@@ -1486,7 +2057,7 @@ def handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id):
                         if send_document_to_bot(TELEGRAM_BOT_TOKEN, chat_id, file_content, filename, caption):
                             # Mark as retrieved
                             item_data["retrieved"] = True
-                            item_data["retrieved_date"] = datetime.utcnow().isoformat() + "Z"
+                            item_data["retrieved_date"] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                             readwise_count += 1
                             total_delivered += 1
                             
@@ -1511,7 +2082,7 @@ def handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id):
         logging.error(error_msg)
         return error_msg
 
-def lambda_handler(event, context):
+def lambda_handler(event, context=None):
     try:
         # Load model configuration from Parameter Store first
         try:
@@ -1539,6 +2110,7 @@ def lambda_handler(event, context):
         MAILGUN_API_KEY = get_parameter(ssm, MAILGUN_API_KEY_SSM_PATH)
         MAILGUN_DOMAIN = get_parameter(ssm, MAILGUN_DOMAIN_SSM_PATH)
         NOTION_TOKEN = get_parameter(ssm, NOTION_TOKEN_SSM_PATH)
+        NOTION_JRV_TOKEN = get_parameter(ssm, NOTION_JRV_TOKEN_SSM_PATH)
 
         print(f"DEBUG: The event received is: {event}")
         message = json.loads(event['body'])['message']
@@ -1626,27 +2198,58 @@ def lambda_handler(event, context):
             # If no https links are found, proceed as normal
             pass
         
-        if text.strip().lower() == "/journal":
-            response = "Journal mode activated. Your subsequent messages will be saved as journal entries. Use /new to exit journal mode."
-        elif is_in_journal_mode(current_user, S3_BUCKET):
-            if text.strip().lower() == "/new":
-                response = "Journal mode deactivated. Your messages will now be processed normally."
-            else:
-                save_journal_entry(text, S3_BUCKET, "journal")
-                response = "Your journal entry has been saved."
-        elif text.strip().lower() == "/journalgpt":
-            response = "JournalGPT mode activated. You're now in a conversation with an AI coach journaling assistant. Use /new to exit JournalGPT mode."
-        elif is_in_journalgpt_mode(current_user, S3_BUCKET):
-            if text.strip().lower() == "/new":
-                response = "JournalGPT mode deactivated. Your messages will now be processed normally."
-            else:
-                response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-                save_journal_entry(f"User: {text}\nAI: {response}", S3_BUCKET, "journalgpt")
-        elif text.strip().lower().startswith("/new"):
-            text = "(/new) Let's start a new conversation."
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-        elif text.strip().lower().startswith("/exam"):
-            text = """(/exam) 
+        # Initialize response variable
+        response = None
+        
+        # First, check if this is a mode command
+        new_mode, mode_response = mode_manager.process_mode_command(text, current_user, S3_BUCKET)
+        if mode_response:
+            # Mode command was processed, use the response
+            response = mode_response
+            # Special handling for /new command to generate AI response
+            if text.strip().lower() == "/new" and new_mode == 'normal':
+                # Also generate an AI response for new conversation
+                ai_text = "(/new) Let's start a new conversation."
+                ai_response = generate_response(ai_text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+                response = f"{response}\n\n{ai_response}"
+        else:
+            # Not a mode command, check current mode and handle accordingly
+            current_mode = mode_manager.get_current_mode(current_user, S3_BUCKET)
+            logger.info(f"Current mode for {current_user}: {current_mode}, text: '{text}'")
+            
+            if current_mode == 'journal':
+                if text.strip().lower().startswith("/"):
+                    # Process other commands while in journal mode
+                    pass  # Let it fall through to command processing
+                else:
+                    # Non-command text in journal mode - save to Notion only
+                    logger.info(f"Handling journal entry: '{text}'")
+                    response = handle_journal_mode(text, NOTION_JRV_TOKEN)
+                    logger.info(f"Journal response: '{response}'")
+            
+            elif current_mode == 'journalgpt':
+                if text.strip().lower().startswith("/"):
+                    # Process other commands while in journalgpt mode
+                    pass  # Let it fall through to command processing
+                else:
+                    # Non-command text in journalgpt mode - save with AI coaching
+                    response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME, NOTION_JRV_TOKEN)
+            
+            elif current_mode == 'agent':
+                if text.strip().lower().startswith("/"):
+                    # Process other commands while in agent mode
+                    pass  # Let it fall through to command processing
+                else:
+                    # Non-command text in agent mode - use function calling
+                    response = handle_agent_mode(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MAILGUN_API_KEY, MAILGUN_DOMAIN, NOTION_TOKEN, NOTION_JRV_TOKEN)
+        
+        # Process other commands if not already handled
+        if response is None:
+            if text.strip().lower().startswith("/new"):
+                text = "(/new) Let's start a new conversation."
+                response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            elif text.strip().lower().startswith("/exam"):
+                text = """(/exam) 
             Ask the user for his understanding on the article/transcript/podcast that is being discussed 
 
             You can ask him to summarize or explain you specific sections, or concepts. Then tell him where he is right or wrong and why. 
@@ -1662,9 +2265,9 @@ def lambda_handler(event, context):
 
             Do not make any information up and respond only with information from the text. If it does not appear or you do not know then say so without making up information.
             """
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-        elif text.strip().lower().startswith("/reflect"):
-            text = """(/reflect) 
+                response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            elif text.strip().lower().startswith("/reflect"):
+                text = """(/reflect) 
             You are an AI assistant designed to function as a reflective journal for the user. Your primary role is to generate daily or periodic prompts that encourage the user to reflect deeply on various aspects of their life. These prompts should be designed to help the user gain insight into their thoughts, feelings, behaviors, and overall well-being. You will not receive or expect any responses from the user, so your goal is to provide thought-provoking, introspective prompts that the user can contemplate and perhaps write about elsewhere.
 
             Your prompts should cover a range of topics, including but not limited to these topics:
@@ -1697,108 +2300,119 @@ def lambda_handler(event, context):
 
             Remember, your role is to provide supportive, non-judgmental prompts that encourage the user to think deeply and compassionately about themselves. Your prompts should be varied and cater to different aspects of the user's life and inner experiences, helping them to continuously grow and improve without needing to respond directly to you.
             """
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-        elif text.strip().lower().startswith("/stampy"):
-            stampy_query = text[7:].strip()
-            
-            if not stampy_query:
-                stampy_query = get_previous_user_message(current_user, S3_BUCKET)
+                response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            elif text.strip().lower().startswith("/stampy"):
+                stampy_query = text[7:].strip()
+                
                 if not stampy_query:
-                    send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "No previous question found to ask Stampy.")
-                    return {
-                        'statusCode': 200,
-                        'body': json.dumps('No previous question found.')
-                    }
-            
-            stampy_response = ask_stampy(stampy_query)
-            if stampy_response:
-                formatted_response = format_text_response(stampy_response)
-                response = f"Stampy's response to '{stampy_query}':\n\n{formatted_response}"
-            else:
-                response = "Sorry, I couldn't get a response from Stampy."
-        elif text.strip().lower().startswith("/transcript"):
-            previous_url = get_previous_url(current_user, S3_BUCKET)
-            if previous_url:
-                parsed_url = urlparse(previous_url)
-                if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                    content = process_youtube_link(parsed_url, RAPIDAPI_KEY,  transcript_only=True)
-                    response = f"Here's the transcript of the video:\n\n{content}"
+                    stampy_query = get_previous_user_message(current_user, S3_BUCKET)
+                    if not stampy_query:
+                        send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "No previous question found to ask Stampy.")
+                        return {
+                            'statusCode': 200,
+                            'body': json.dumps('No previous question found.')
+                        }
+                
+                stampy_response = ask_stampy(stampy_query)
+                if stampy_response:
+                    formatted_response = format_text_response(stampy_response)
+                    response = f"Stampy's response to '{stampy_query}':\n\n{formatted_response}"
                 else:
-                    content = process_generic_link(previous_url, transcript_only=True)
-                    response = f"Here's the transcript of the content:\n\n{content}"
-            else:
-                response = "No previous URL found. Please provide a YouTube URL for transcription."
-            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
-            return {
-                'statusCode': 200,
-                'body': json.dumps('Transcript request processed.')
-            }
-        elif text.strip().lower().startswith("/email"):
-            # Extract any additional info after /email command
-            email_parts = text.strip().split(maxsplit=1)
-            additional_info = email_parts[1] if len(email_parts) > 1 else ""
-            
-            # Load conversation history
-            conversation_history = load_conversation_history(current_user, S3_BUCKET)
-            
-            # Prepare conversation data
-            conversation_data = {
-                'username': current_user,
-                'history': conversation_history
-            }
-            
-            # Prepare email subject with unique timestamp
-            subject = f"Telegram Bot Conversation - {current_user} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            # Send email
-            success, result = send_email_via_mailgun(
-                recipient_email="jaime.raldua.veuthey@gmail.com",
-                subject=subject,
-                conversation_data=conversation_data,
-                additional_info=additional_info,
-                mailgun_api_key=MAILGUN_API_KEY,
-                mailgun_domain=MAILGUN_DOMAIN
-            )
-            
-            if success:
-                response = f"📧 Email sent successfully! Message ID: {result}"
-            else:
-                response = f"❌ Failed to send email: {result}"
-        elif text.strip().lower().startswith("/retrieve"):
-            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "🔄 Retrieving content from processor...")
-            response = handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id)
-            send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
-            return {
-                'statusCode': 200,
-                'body': json.dumps('Retrieve request processed.')
-            }
-        elif text.strip().lower() == "/agent":
-            response = "🤖 Agent mode activated! I can now help you:\n\n• Send email reminders\n• Create tasks in Notion\n\nJust tell me what you need to do, and I'll handle it for you.\n\nExamples:\n- 'Send me an email to remind me to do the dishes before tomorrow'\n- 'Create a Notion task to review the quarterly report'\n\nUse /new to exit agent mode."
-        elif is_in_agent_mode(current_user, S3_BUCKET):
-            if text.strip().lower() == "/new":
-                response = "Agent mode deactivated. Your messages will now be processed normally."
-            else:
-                response = handle_agent_mode(text, current_user, S3_BUCKET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MAILGUN_API_KEY, MAILGUN_DOMAIN, NOTION_TOKEN)
-        elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
-            parsed_url = urlparse(text)
-            print(f"DEBUG: The parsed_url that will be passed for the normal processing is '{parsed_url}'")
-            print(f"DEBUG: The parsed_url.netloc that will be used for the normal processing is '{parsed_url.netloc}'")
-            if parsed_url.scheme and parsed_url.netloc:
-                if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                    content = process_youtube_link(parsed_url, RAPIDAPI_KEY)
-                    text = f'{text} \n Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
-                elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
-                    content = process_generic_link(text)
-                    text = f'{text} \n Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n"""{content}"""'
+                    response = "Sorry, I couldn't get a response from Stampy."
+            elif text.strip().lower().startswith("/transcript"):
+                previous_url = get_previous_url(current_user, S3_BUCKET)
+                if previous_url:
+                    parsed_url = urlparse(previous_url)
+                    if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
+                        content = process_youtube_link(parsed_url, RAPIDAPI_KEY,  transcript_only=True)
+                        response = f"Here's the transcript of the video:\n\n{content}"
+                    else:
+                        content = process_generic_link(previous_url, transcript_only=True)
+                        response = f"Here's the transcript of the content:\n\n{content}"
                 else:
-                    text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
-            
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-        else: 
-            # text = f"Check in our current conversation and return: '{text}'"
-            response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+                    response = "No previous URL found. Please provide a YouTube URL for transcription."
+                send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Transcript request processed.')
+                }
+            elif text.strip().lower().startswith("/email"):
+                # Extract any additional info after /email command
+                email_parts = text.strip().split(maxsplit=1)
+                additional_info = email_parts[1] if len(email_parts) > 1 else ""
+                
+                # Load conversation history
+                conversation_history = load_conversation_history(current_user, S3_BUCKET)
+                
+                # Prepare conversation data
+                conversation_data = {
+                    'username': current_user,
+                    'history': conversation_history
+                }
+                
+                # Prepare email subject with unique timestamp
+                subject = f"Telegram Bot Conversation - {current_user} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                
+                # Send email
+                success, result = send_email_via_mailgun(
+                    recipient_email="jaime.raldua.veuthey@gmail.com",
+                    subject=subject,
+                    conversation_data=conversation_data,
+                    additional_info=additional_info,
+                    mailgun_api_key=MAILGUN_API_KEY,
+                    mailgun_domain=MAILGUN_DOMAIN
+                )
+                
+                if success:
+                    response = f"📧 Email sent successfully! Message ID: {result}"
+                else:
+                    response = f"❌ Failed to send email: {result}"
+            elif text.strip().lower().startswith("/retrieve"):
+                send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, "🔄 Retrieving content from processor...")
+                response = handle_retrieve_command(TELEGRAM_BOT_TOKEN, chat_id)
+                send_message_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Retrieve request processed.')
+                }
+            elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
+                parsed_url = urlparse(text)
+                print(f"DEBUG: The parsed_url that will be passed for the normal processing is '{parsed_url}'")
+                print(f"DEBUG: The parsed_url.netloc that will be used for the normal processing is '{parsed_url.netloc}'")
+                if parsed_url.scheme and parsed_url.netloc:
+                    if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
+                        content = process_youtube_link(parsed_url, RAPIDAPI_KEY)
+                        text = f'{text} \n Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
+                    elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
+                        content = process_generic_link(text)
+                        text = f'{text} \n Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n"""{content}"""'
+                    else:
+                        text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
+                
+                response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+            else:
+                # Get current mode using the mode manager
+                current_mode = mode_manager.get_current_mode(current_user, S3_BUCKET)
+                
+                if current_mode == 'normal':
+                    # Normal conversational response
+                    response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+                else:
+                    # If in a special mode but text wasn't handled, it means it was an unrecognized command
+                    # Only set a default response if we don't already have one
+                    if response is None:
+                        if current_mode == 'journal':
+                            response = "📓 You're in journal mode. Please enter your journal entry or use /new to exit."
+                        elif current_mode == 'journalgpt':
+                            response = "📓 You're in JournalGPT mode. Please enter your journal entry or use /new to exit."
+                        elif current_mode == 'agent':
+                            response = "🤖 You're in agent mode. Please tell me what task you need help with or use /new to exit."
 
-        print(f"DEBUG: The response from generate_response is '{response}")
+        # Ensure we have a response
+        if response is None:
+            response = "Sorry, I couldn't process your request."
+            
+        print(f"DEBUG: The response from generate_response is '{response}'")
 
         audio_warning = ""
         if BOT_AUDIO_RESPONSE and len(response) > MAX_RESPONSE_LENGTH_AUDIO:
@@ -1807,7 +2421,7 @@ def lambda_handler(event, context):
         full_response = response + audio_warning
 
         if current_user == AUX_USERNAME:
-            print(f"DEBUG: The current_user is AUX_USERNAME")
+            print("DEBUG: The current_user is AUX_USERNAME")
             for user_id in USERS_ALLOWED:
                 user_chat_id = get_user_chat_id(user_id)
                 if user_chat_id:
@@ -1820,17 +2434,25 @@ def lambda_handler(event, context):
             if BOT_AUDIO_RESPONSE and len(response) <= MAX_RESPONSE_LENGTH_AUDIO:
                 send_audio_to_bot(TELEGRAM_BOT_TOKEN, chat_id, response)
 
-        message_data = {
-            "uuid": uuid,
-            "message_id": message["message_id"],
-            "from": message["from"],
-            "chat": message["chat"],
-            "date": timestamp, 
-            "human_readable_date": datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
-            "text": text,
-            "response": response
-        }
-        save_message_to_json(current_user, message_data, S3_BUCKET)
+        # Only save to conversation history if not in journal mode (but save journal commands themselves)
+        should_save_to_history = True
+        current_mode = mode_manager.get_current_mode(current_user, S3_BUCKET)
+        if current_mode == 'journal' and not text.strip().lower().startswith("/"):
+            # Don't save non-command messages in journal mode
+            should_save_to_history = False
+        
+        if should_save_to_history:
+            message_data = {
+                "uuid": uuid,
+                "message_id": message["message_id"],
+                "from": message["from"],
+                "chat": message["chat"],
+                "date": timestamp, 
+                "human_readable_date": datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                "text": text,
+                "response": response
+            }
+            save_message_to_json(current_user, message_data, S3_BUCKET)
         return {
             'statusCode': 200,
             'body': json.dumps('Lambda finished OK.')
@@ -1881,9 +2503,19 @@ def main():
     
     RESPOND_LAST_N_MESSAGES = 1
     context =''
-    ssm = boto3.client('ssm', region_name=region)  # Adjust the region as needed.
-    s3_client = boto3.client('s3', region_name=region)
-    polly = boto3.client('polly')
+    
+    # Initialize AWS clients for local development
+    try:
+        ssm = boto3.client('ssm', region_name=region)  # Adjust the region as needed.
+        s3_client = boto3.client('s3', region_name=region)
+        polly = boto3.client('polly')
+        logger.info("AWS clients initialized successfully for local development")
+    except Exception as e:
+        logger.error(f"Failed to initialize AWS clients: {e}")
+        # Continue without AWS services for pure local testing
+        ssm = None
+        s3_client = None
+        polly = None
     TELEGRAM_BOT_TOKEN = get_parameter(ssm, TELEGRAM_BOT_TOKEN_SSM_PATH)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     response = requests.get(url)
