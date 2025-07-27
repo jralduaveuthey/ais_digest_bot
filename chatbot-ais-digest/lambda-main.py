@@ -561,6 +561,7 @@ def is_in_journalgpt_mode(username, S3_BUCKET):
     return mode_manager.get_current_mode(username, S3_BUCKET) == 'journalgpt'
 
 def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, model_name, notion_jrv_token):
+    logger.info(f"DEBUG JournalGPT: Starting response for user {username}, token present: {bool(notion_jrv_token)}")
     journalgpt_prompt_template = """You are an AI coach assistant for journaling. Your role is to provide supportive, 
     insightful, and thought-provoking responses to the user's journal entries. Encourage self-reflection, personal growth, 
     and emotional awareness. Be empathetic and non-judgmental in your responses. If appropriate, you may ask follow-up 
@@ -586,6 +587,7 @@ def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_AP
     
     # If this is the first message after /journalgpt, create the initial entry
     if found_start and len(journalgpt_history) == 0:
+        logger.info(f"DEBUG JournalGPT: Creating first entry, token: {notion_jrv_token[:20] if notion_jrv_token else 'None'}...")
         success, page_id, url = create_journalgpt_entry(text, notion_jrv_token)
         if success:
             journalgpt_page_id = page_id
@@ -644,6 +646,7 @@ def get_journalgpt_response(text, username, S3_BUCKET, OPENAI_API_KEY, GOOGLE_AP
         return ai_response
 
 def create_journalgpt_entry(text: str, notion_jrv_token: str) -> tuple:
+    logger.info(f"DEBUG JournalGPT: create_journalgpt_entry called, token: {notion_jrv_token[:20] if notion_jrv_token else 'None'}...")
     """Create initial JournalGPT entry in Notion and return (success, page_id, url)."""
     import uuid
     
@@ -2233,6 +2236,7 @@ def lambda_handler(event, context=None):
                     pass  # Let it fall through to command processing
                 else:
                     # Non-command text in journalgpt mode - save with AI coaching
+                    logger.info(f"DEBUG JournalGPT: Processing message in journalgpt mode")
                     response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME, NOTION_JRV_TOKEN)
             
             elif current_mode == 'agent':
