@@ -309,12 +309,18 @@ class ModeManager:
     
     def get_current_mode(self, username: str, S3_BUCKET: str) -> str:
         """Get the current mode for a user by checking their mode state."""
+        logger.info(f"ModeManager.get_current_mode() called for user: {username}")
+        
         # First try to load from mode state file
+        logger.info(f"ModeManager: Attempting to load mode state from S3 for user {username}")
         mode_state = self._load_mode_state(username, S3_BUCKET)
         if mode_state:
             mode = mode_state.get('mode', 'normal')
-            logger.info(f"ModeManager: Loaded mode '{mode}' from state file for user {username}")
+            logger.info(f"ModeManager: Successfully loaded mode '{mode}' from state file for user {username}")
+            logger.info(f"ModeManager: Full state data: {mode_state}")
             return mode
+        else:
+            logger.info(f"ModeManager: No mode state found in S3 for user {username}")
         
         # Fallback to history-based detection for backward compatibility
         logger.info(f"ModeManager: No state file found for {username}, checking history")
@@ -341,12 +347,17 @@ class ModeManager:
     def process_mode_command(self, text: str, username: str, S3_BUCKET: str) -> Tuple[Optional[str], Optional[str]]:
         """Process mode commands and return (new_mode, response)."""
         cmd = text.strip().lower()
+        logger.info(f"ModeManager.process_mode_command() - checking command: '{cmd}' for user {username}")
         
         if cmd not in self.mode_commands:
+            logger.info(f"ModeManager: '{cmd}' is not a mode command")
             return None, None
         
         new_mode = self.mode_commands[cmd]
+        logger.info(f"ModeManager: Mode command recognized - new mode will be '{new_mode}'")
+        
         current_mode = self.get_current_mode(username, S3_BUCKET)
+        logger.info(f"ModeManager: Current mode is '{current_mode}', switching to '{new_mode}'")
         
         # Save the new mode state
         self._save_mode_state(username, S3_BUCKET, new_mode)
@@ -372,52 +383,71 @@ class ModeManager:
     
     def _load_mode_state(self, username: str, S3_BUCKET: str) -> dict:
         """Load mode state from S3 or local file."""
+        logger.info(f"ModeManager._load_mode_state() called - user: {username}, bucket: {S3_BUCKET}")
+        
         try:
+            logger.info(f"ModeManager: s3_client is {'available' if s3_client else 'None'}")
             if not s3_client:
+                logger.warning("ModeManager: S3 client not available, trying local file")
                 # Try local file fallback for development
                 return self._load_local_mode_state(username)
             
             filename = f"mode_state/{username}.json"
+            logger.info(f"ModeManager: Attempting to load from S3 - Bucket: {S3_BUCKET}, Key: {filename}")
+            
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
             state = json.loads(response['Body'].read().decode('utf-8'))
-            logger.info(f"ModeManager: Loaded state from S3: {state}")
+            logger.info(f"ModeManager: Successfully loaded state from S3: {state}")
             return state
-        except AttributeError:
-            logger.warning("ModeManager: S3 client not available, trying local file")
+        except AttributeError as e:
+            logger.warning(f"ModeManager: S3 client AttributeError: {e}, trying local file")
             return self._load_local_mode_state(username)
         except s3_client.exceptions.NoSuchKey:
-            logger.info(f"ModeManager: No state file found in S3 for {username}")
+            logger.info(f"ModeManager: No state file found in S3 for {username} (NoSuchKey)")
             return None
         except Exception as e:
-            logger.warning(f"ModeManager: Error loading mode state from S3: {e}")
+            logger.warning(f"ModeManager: Error loading mode state from S3: {type(e).__name__}: {e}")
+            logger.warning(f"ModeManager: Full exception details: {repr(e)}")
+            # In Lambda, don't fall back to local file - return None instead
+            if is_running_in_lambda():
+                logger.warning("ModeManager: Running in Lambda, not falling back to local file")
+                return None
             return self._load_local_mode_state(username)
     
     def _save_mode_state(self, username: str, S3_BUCKET: str, mode: str):
         """Save mode state to S3 or local file."""
+        logger.info(f"ModeManager._save_mode_state() called - user: {username}, mode: {mode}, bucket: {S3_BUCKET}")
+        
         state = {
             'mode': mode,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'version': '1.0'
         }
+        logger.info(f"ModeManager: State to save: {state}")
         
         try:
+            logger.info(f"ModeManager: s3_client is {'available' if s3_client else 'None'}")
             if not s3_client:
+                logger.warning("ModeManager: S3 client not available, using local file")
                 # Save to local file for development
                 self._save_local_mode_state(username, state)
                 return
             
             filename = f"mode_state/{username}.json"
+            logger.info(f"ModeManager: Attempting to save to S3 - Bucket: {S3_BUCKET}, Key: {filename}")
+            
             s3_client.put_object(
                 Bucket=S3_BUCKET,
                 Key=filename,
                 Body=json.dumps(state)
             )
-            logger.info(f"ModeManager: Saved mode '{mode}' to S3 for user {username}")
-        except AttributeError:
-            logger.error("ModeManager: S3 client not available, saving to local file")
+            logger.info(f"ModeManager: Successfully saved mode '{mode}' to S3 for user {username}")
+        except AttributeError as e:
+            logger.error(f"ModeManager: S3 client AttributeError: {e}, saving to local file")
             self._save_local_mode_state(username, state)
         except Exception as e:
-            logger.error(f"ModeManager: Error saving mode state to S3: {e}")
+            logger.error(f"ModeManager: Error saving mode state to S3: {type(e).__name__}: {e}")
+            logger.error(f"ModeManager: Full exception details: {repr(e)}")
             self._save_local_mode_state(username, state)
     
     def _load_local_mode_state(self, username: str) -> dict:
@@ -2205,9 +2235,11 @@ def lambda_handler(event, context=None):
         response = None
         
         # First, check if this is a mode command
+        logger.info(f"Main handler: Checking if '{text}' is a mode command for user {current_user}")
         new_mode, mode_response = mode_manager.process_mode_command(text, current_user, S3_BUCKET)
         if mode_response:
             # Mode command was processed, use the response
+            logger.info(f"Main handler: Mode command processed - new_mode: {new_mode}, response: {mode_response[:100]}...")
             response = mode_response
             # Special handling for /new command to generate AI response
             if text.strip().lower() == "/new" and new_mode == 'normal':
@@ -2217,8 +2249,9 @@ def lambda_handler(event, context=None):
                 response = f"{response}\n\n{ai_response}"
         else:
             # Not a mode command, check current mode and handle accordingly
+            logger.info(f"Main handler: Not a mode command, checking current mode for user {current_user}")
             current_mode = mode_manager.get_current_mode(current_user, S3_BUCKET)
-            logger.info(f"Current mode for {current_user}: {current_mode}, text: '{text}'")
+            logger.info(f"Main handler: Current mode detected as '{current_mode}' for {current_user}, processing text: '{text}'")
             
             if current_mode == 'journal':
                 if text.strip().lower().startswith("/"):
@@ -2231,13 +2264,19 @@ def lambda_handler(event, context=None):
                     logger.info(f"Journal response: '{response}'")
             
             elif current_mode == 'journalgpt':
+                logger.info(f"Main handler: Entering journalgpt mode branch")
                 if text.strip().lower().startswith("/"):
                     # Process other commands while in journalgpt mode
+                    logger.info(f"Main handler: Command detected in journalgpt mode: '{text}'")
                     pass  # Let it fall through to command processing
                 else:
                     # Non-command text in journalgpt mode - save with AI coaching
-                    logger.info(f"DEBUG JournalGPT: Processing message in journalgpt mode")
+                    logger.info(f"Main handler: Processing non-command text in journalgpt mode")
+                    logger.info(f"DEBUG JournalGPT: About to call get_journalgpt_response for user {current_user}")
                     response = get_journalgpt_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME, NOTION_JRV_TOKEN)
+                    logger.info(f"Main handler: JournalGPT response received, length: {len(response) if response else 0}")
+                    # Important: Skip further processing since we have a response
+                    logger.info(f"Main handler: JournalGPT mode handled, skipping further processing")
             
             elif current_mode == 'agent':
                 if text.strip().lower().startswith("/"):
@@ -2380,37 +2419,43 @@ def lambda_handler(event, context=None):
                     'body': json.dumps('Retrieve request processed.')
                 }
             elif text.strip().lower().startswith("http") or text.strip().lower().startswith("www"):
-                parsed_url = urlparse(text)
-                print(f"DEBUG: The parsed_url that will be passed for the normal processing is '{parsed_url}'")
-                print(f"DEBUG: The parsed_url.netloc that will be used for the normal processing is '{parsed_url.netloc}'")
-                if parsed_url.scheme and parsed_url.netloc:
-                    if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
-                        content = process_youtube_link(parsed_url, RAPIDAPI_KEY)
-                        text = f'{text} \n Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
-                    elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
-                        content = process_generic_link(text)
-                        text = f'{text} \n Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n"""{content}"""'
-                    else:
-                        text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
-                
-                response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-            else:
-                # Get current mode using the mode manager
-                current_mode = mode_manager.get_current_mode(current_user, S3_BUCKET)
-                
-                if current_mode == 'normal':
-                    # Normal conversational response
+                # Only process URLs if we don't already have a response from mode handling
+                if response is None:
+                    parsed_url = urlparse(text)
+                    print(f"DEBUG: The parsed_url that will be passed for the normal processing is '{parsed_url}'")
+                    print(f"DEBUG: The parsed_url.netloc that will be used for the normal processing is '{parsed_url.netloc}'")
+                    if parsed_url.scheme and parsed_url.netloc:
+                        if 'youtube' in parsed_url.netloc or 'youtu.be' in parsed_url.netloc:
+                            content = process_youtube_link(parsed_url, RAPIDAPI_KEY)
+                            text = f'{text} \n Please first fully understand the following transcript: """{content}""". Now make a short summary of the transcript and get ready for questions from the user.'
+                        elif parsed_url.netloc not in FORBIDDEN_DOMAINS:
+                            content = process_generic_link(text)
+                            text = f'{text} \n Please fully understand the following content from {parsed_url.netloc} and be ready for questions from the user: \n"""{content}"""'
+                        else:
+                            text = f"The user shared this link: {text}. Please acknowledge it and say that you cannot work with it because it is not in the allowed domains."
+                    
                     response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
-                else:
-                    # If in a special mode but text wasn't handled, it means it was an unrecognized command
-                    # Only set a default response if we don't already have one
-                    if response is None:
-                        if current_mode == 'journal':
-                            response = "📓 You're in journal mode. Please enter your journal entry or use /new to exit."
-                        elif current_mode == 'journalgpt':
-                            response = "📓 You're in JournalGPT mode. Please enter your journal entry or use /new to exit."
-                        elif current_mode == 'agent':
-                            response = "🤖 You're in agent mode. Please tell me what task you need help with or use /new to exit."
+            else:
+                # Only process if we don't already have a response from mode handling
+                if response is None:
+                    logger.info(f"Main handler: No response yet, checking for fallback processing")
+                    # Get current mode using the mode manager
+                    current_mode = mode_manager.get_current_mode(current_user, S3_BUCKET)
+                    logger.info(f"Main handler: Fallback mode check - current mode: {current_mode}")
+                    
+                    if current_mode == 'normal':
+                        # Normal conversational response
+                        response = generate_response(text, current_user, S3_BUCKET, OPENAI_API_KEY, GOOGLE_API_KEY, TELEGRAM_BOT_TOKEN, chat_id, MODEL_NAME)
+                    else:
+                        # If in a special mode but text wasn't handled, it means it was an unrecognized command
+                        # Only set a default response if we don't already have one
+                        if response is None:
+                            if current_mode == 'journal':
+                                response = "📓 You're in journal mode. Please enter your journal entry or use /new to exit."
+                            elif current_mode == 'journalgpt':
+                                response = "📓 You're in JournalGPT mode. Please enter your journal entry or use /new to exit."
+                            elif current_mode == 'agent':
+                                response = "🤖 You're in agent mode. Please tell me what task you need help with or use /new to exit."
 
         # Ensure we have a response
         if response is None:
